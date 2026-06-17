@@ -1387,17 +1387,29 @@ function fileToBase64(file) {
 }
 
 function StatementAnalyser({ data, patch }) {
-  const [open, setOpen] = useState(false);
+  // Remember the last analysis so it survives the phone reloading the page in the background.
+  const [saved] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("mr_analysis") || "null"); } catch { return null; }
+  });
+  const [open, setOpen] = useState(!!(saved && saved.result));
   const [text, setText] = useState("");
   const [pdfBase64, setPdfBase64] = useState("");
-  const [fileName, setFileName] = useState("");
+  const [fileName, setFileName] = useState(saved?.fileName || "");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [result, setResult] = useState(null);
-  const [imported, setImported] = useState(false);
-  const [addedKeys, setAddedKeys] = useState([]);
+  const [result, setResult] = useState(saved?.result || null);
+  const [imported, setImported] = useState(saved?.imported || false);
+  const [addedKeys, setAddedKeys] = useState(saved?.addedKeys || []);
   const [extracting, setExtracting] = useState(false);
   const [expandedCat, setExpandedCat] = useState(null);
+
+  // Keep that saved copy in sync, and clear it when the analysis is cleared.
+  useEffect(() => {
+    try {
+      if (result) localStorage.setItem("mr_analysis", JSON.stringify({ result, fileName, imported, addedKeys }));
+      else localStorage.removeItem("mr_analysis");
+    } catch {}
+  }, [result, fileName, imported, addedKeys]);
 
   const onFile = async (e) => {
     const f = e.target.files && e.target.files[0];
@@ -1538,6 +1550,15 @@ function StatementAnalyser({ data, patch }) {
 
           {result && (
             <div className="space-y-4 pt-1">
+              <div className="flex items-center justify-between gap-3">
+                <p className="truncate text-xs text-slate-400">{fileName ? `From ${fileName}` : "Your last analysis"}</p>
+                <button
+                  onClick={() => { setResult(null); setFileName(""); setImported(false); setAddedKeys([]); setText(""); }}
+                  className="shrink-0 text-xs font-medium text-slate-400 underline-offset-2 hover:text-slate-600 hover:underline"
+                >
+                  Clear
+                </button>
+              </div>
               <div className="grid grid-cols-2 gap-3">
                 <Stat label="Money in" value={gbp0(result.totalIn || 0)} accent="text-teal-700" />
                 <Stat label="Money out" value={gbp0(result.totalOut || 0)} accent="text-rose-600" />
