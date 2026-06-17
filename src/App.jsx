@@ -588,7 +588,7 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
 
   return (
     <div className="min-h-screen bg-stone-50 text-slate-800">
-      <div className="mx-auto flex w-full max-w-5xl">
+      <div className="mx-auto flex w-full max-w-7xl">
         <aside className="sticky top-0 hidden h-screen w-56 shrink-0 flex-col border-r border-stone-200 bg-white/50 px-3 py-6 lg:flex">
           <div className="mb-6 flex items-center gap-2 px-3">
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-teal-600 text-white">
@@ -616,7 +616,7 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
           </nav>
         </aside>
 
-        <div className="mx-auto w-full max-w-md px-4 pb-28 pt-6 lg:mx-0 lg:max-w-3xl lg:flex-1 lg:px-8 lg:pb-12">
+        <div className="mx-auto w-full max-w-md px-4 pb-28 pt-6 lg:mx-0 lg:max-w-none lg:flex-1 lg:px-8 lg:pb-12">
         <header className="mb-5 flex items-center justify-between">
           <div>
             <Eyebrow>Money, made glanceable</Eyebrow>
@@ -759,7 +759,7 @@ function Home({
   const needDraw = shortfall > 0;
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 lg:columns-2 lg:gap-5 lg:space-y-0 lg:[&>*]:mb-5 lg:[&>*]:break-inside-avoid">
       {/* Hero — balance-based */}
       <div
         className={`rounded-3xl p-6 text-white shadow-sm ${
@@ -1257,7 +1257,7 @@ function Income({
   };
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 lg:columns-2 lg:gap-5 lg:space-y-0 lg:[&>*]:mb-5 lg:[&>*]:break-inside-avoid">
       <div className="rounded-3xl bg-slate-900 p-5 text-white shadow-sm">
         <p className="text-xs font-semibold uppercase tracking-widest" style={{ color: "rgba(255,255,255,0.6)" }}>
           Drawn this month
@@ -1456,7 +1456,7 @@ function Bills({ data, acctById, billsTotal, patch }) {
   const sorted = [...data.bills].sort((a, b) => a.day - b.day);
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 lg:columns-2 lg:gap-5 lg:space-y-0 lg:[&>*]:mb-5 lg:[&>*]:break-inside-avoid">
       <SummaryBar label="Regular bills, every month" value={billsTotal}
         sub={`${data.bills.length} bill${data.bills.length === 1 ? "" : "s"}`} />
 
@@ -1965,7 +1965,7 @@ function Spend({ data, acctById, spentThisMonth, patch }) {
   }, [monthTx]);
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 lg:columns-2 lg:gap-5 lg:space-y-0 lg:[&>*]:mb-5 lg:[&>*]:break-inside-avoid">
       <SummaryBar label="Spent this month" value={spentThisMonth} sub="not counting bills & loans" />
 
       <StatementAnalyser data={data} patch={patch} />
@@ -2378,7 +2378,7 @@ function LoansTab({ data, drawnThisMonth, patch }) {
   const anyDebt = data.loans.length + biz.loans.length + cards.length > 0;
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 lg:columns-2 lg:gap-5 lg:space-y-0 lg:[&>*]:mb-5 lg:[&>*]:break-inside-avoid">
       {anyDebt && (
         <Card>
           <Eyebrow>Your total debt</Eyebrow>
@@ -2968,7 +2968,7 @@ function Setup({ data, patch, onReset, onExample, householdCode, onSignOut }) {
   };
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 lg:columns-2 lg:gap-5 lg:space-y-0 lg:[&>*]:mb-5 lg:[&>*]:break-inside-avoid">
       {/* account */}
       <Card>
         <Eyebrow>Your account</Eyebrow>
