@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useRef, useCallback } from "react"
 import { supabase } from "./supabaseClient";
 import {
   Wallet, CalendarClock, ShoppingBag, Landmark, Settings2,
-  Plus, Trash2, Check, ArrowDownCircle, X, Sparkles, Banknote,
+  Plus, Trash2, Check, ArrowDownCircle, X, Sparkles, Banknote, Pencil,
   Briefcase, AlertTriangle, CreditCard, Upload, ChevronUp, ChevronDown,
 } from "lucide-react";
 import {
@@ -51,11 +51,11 @@ const DRAW_TYPE_COLOURS = {
 const ANALYSIS_PROMPT =
   'You are analysing a personal bank statement. Read the statement data and reply with ONLY a single minified JSON object — no markdown, no backticks, no commentary — in exactly this shape: ' +
   '{"currency":"GBP","period":"<human date range or empty string>","totalIn":<number>,"totalOut":<number>,' +
-  '"byCategory":[{"category":"<Groceries|Eating out|Fuel / transport|Shopping|Subscriptions|Bills & utilities|Cash|Transfers|Health|Kids|Home|Fun|Other>","amount":<number>}],' +
+  '"byCategory":[{"category":"<Groceries|Eating out|Fuel / transport|Shopping|Subscriptions|Bills & utilities|Cash|Transfers|Health|Kids|Home|Fun|Other>","amount":<number>,"items":[{"description":"<payee>","amount":<number>,"date":"<DD Mon or empty>"}]}],' +
   '"recurring":[{"name":"<payee>","amount":<number>,"cadence":"monthly|weekly|annual","type":"bill|subscription","dayOfMonth":<1-31 or null>}],' +
   '"largest":[{"description":"<payee>","amount":<number>,"date":"<DD Mon or empty>"}],' +
   '"insights":["<short plain-English note>"]}. ' +
-  'Rules: all amounts are positive plain numbers in pounds, no symbols. byCategory covers money going OUT only, top 8 by amount. ' +
+  'Rules: all amounts are positive plain numbers in pounds, no symbols. byCategory covers money going OUT only, top 8 by amount, and each category includes an items array listing every individual transaction in it (description, amount, date). ' +
   'recurring lists payments that look like they repeat (direct debits, standing orders, subscriptions), up to 10, with a best-guess cadence and a day-of-month if monthly. ' +
   'largest lists the top 5 one-off outgoings. insights gives 3 to 5 friendly, practical notes for someone managing money with ADHD — flag subscriptions they may not need, categories higher than expected, or simple wins. Be encouraging, never preachy or shaming. If a value is unknown use 0 or "". Output JSON only.';
 
@@ -324,6 +324,83 @@ const btnPrimary =
 
 const btnGhost =
   "inline-flex items-center justify-center gap-2 rounded-xl border border-stone-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-stone-50";
+
+// A small reusable edit dialog. `fields` describes the inputs; on Save it hands
+// the caller an object of the edited values (number fields parsed to numbers).
+function EditModal({ title, fields, item, onSave, onClose }) {
+  const [draft, setDraft] = useState(() => {
+    const d = {};
+    fields.forEach((f) => {
+      const v = item ? item[f.key] : undefined;
+      d[f.key] = v ?? (f.type === "select" ? (f.options[0]?.value ?? "") : "");
+    });
+    return d;
+  });
+  const set = (k, v) => setDraft((d) => ({ ...d, [k]: v }));
+  const save = () => {
+    const out = {};
+    fields.forEach((f) => {
+      let v = draft[f.key];
+      if (f.type === "money" || f.type === "number" || f.type === "percent")
+        v = v === "" || v == null ? 0 : Number(v);
+      out[f.key] = v;
+    });
+    onSave(out);
+  };
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/40 sm:items-center sm:p-4"
+      onClick={onClose}
+    >
+      <div
+        className="max-h-[90vh] w-full max-w-sm overflow-y-auto rounded-t-3xl bg-white p-5 shadow-xl sm:rounded-3xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-3 flex items-center justify-between">
+          <h3 className="text-lg font-bold text-slate-900">{title}</h3>
+          <button onClick={onClose} className="rounded-full p-1 text-slate-400 transition hover:bg-stone-100">
+            <X size={18} />
+          </button>
+        </div>
+        <div className="space-y-3">
+          {fields.map((f) => (
+            <Field key={f.key} label={f.label}>
+              {f.type === "select" ? (
+                <select className={inputCls} value={draft[f.key]} onChange={(e) => set(f.key, e.target.value)}>
+                  {f.options.map((o) => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  className={inputCls}
+                  type={f.type === "text" ? "text" : "number"}
+                  inputMode={f.type === "text" ? undefined : "decimal"}
+                  step={f.type === "money" || f.type === "percent" ? "0.01" : f.type === "number" ? "1" : undefined}
+                  value={draft[f.key]}
+                  onChange={(e) => set(f.key, e.target.value)}
+                />
+              )}
+            </Field>
+          ))}
+        </div>
+        <div className="mt-4 flex gap-2">
+          <button onClick={onClose} className={`${btnGhost} flex-1`}>Cancel</button>
+          <button onClick={save} className={`${btnPrimary} flex-1`}>Save</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Small pencil button used in lists to open the edit dialog.
+function EditBtn({ onClick }) {
+  return (
+    <button onClick={onClick} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-stone-100 hover:text-slate-600">
+      <Pencil size={15} />
+    </button>
+  );
+}
 
 function CheckToggle({ checked, onChange, label }) {
   return (
@@ -1165,6 +1242,7 @@ function Bills({ data, acctById, billsTotal, patch }) {
   const [amount, setAmount] = useState("");
   const [day, setDay] = useState("1");
   const [accountId, setAccountId] = useState(data.accounts[0]?.id || "");
+  const [editing, setEditing] = useState(null);
 
   const add = () => {
     const amt = parseFloat(amount);
@@ -1250,6 +1328,7 @@ function Bills({ data, acctById, billsTotal, patch }) {
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-bold tabular-nums text-slate-900">{gbp(b.amount)}</span>
+                    <EditBtn onClick={() => setEditing(b)} />
                     <button
                       onClick={() => patch((d) => { d.bills = d.bills.filter((x) => x.id !== b.id); return d; })}
                       className="text-slate-300 hover:text-rose-500"
@@ -1263,6 +1342,28 @@ function Bills({ data, acctById, billsTotal, patch }) {
           </ul>
         )}
       </Card>
+
+      {editing && (
+        <EditModal
+          title="Edit bill"
+          item={editing}
+          fields={[
+            { key: "name", label: "What is it?", type: "text" },
+            { key: "amount", label: "Amount (£)", type: "money" },
+            { key: "day", label: "Day of month", type: "number" },
+            { key: "accountId", label: "Comes out of", type: "select", options: data.accounts.map((a) => ({ value: a.id, label: a.name })) },
+          ]}
+          onClose={() => setEditing(null)}
+          onSave={(vals) => {
+            patch((d) => {
+              const b = d.bills.find((x) => x.id === editing.id);
+              if (b) { b.name = vals.name; b.amount = vals.amount; b.day = Math.min(31, Math.max(1, vals.day || 1)); b.accountId = vals.accountId; }
+              return d;
+            });
+            setEditing(null);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -1289,12 +1390,14 @@ function StatementAnalyser({ data, patch }) {
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
   const [imported, setImported] = useState(false);
+  const [addedKeys, setAddedKeys] = useState([]);
   const [extracting, setExtracting] = useState(false);
+  const [expandedCat, setExpandedCat] = useState(null);
 
   const onFile = async (e) => {
     const f = e.target.files && e.target.files[0];
     if (!f) return;
-    setFileName(f.name); setError(null); setResult(null); setImported(false);
+    setFileName(f.name); setError(null); setResult(null); setImported(false); setAddedKeys([]);
     const isPdf = f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
     if (!isPdf) {
       setText(await f.text()); setPdfBase64("");
@@ -1331,7 +1434,7 @@ function StatementAnalyser({ data, patch }) {
   const canAnalyse = (text.trim().length > 0 || pdfBase64.length > 0) && !loading && !extracting;
 
   const analyse = async () => {
-    setLoading(true); setError(null); setResult(null); setImported(false);
+    setLoading(true); setError(null); setResult(null); setImported(false); setAddedKeys([]);
     try {
       const content = [];
       if (pdfBase64) {
@@ -1358,10 +1461,24 @@ function StatementAnalyser({ data, patch }) {
   const fallback = ["#0d9488", "#4f46e5", "#db2777", "#ea580c", "#7c3aed", "#0891b2", "#65a30d", "#64748b"];
   const recurringMonthly = (result?.recurring || []).filter((r) => r.cadence === "monthly");
 
+  const addOne = (r, i) => {
+    patch((d) => {
+      d.bills.push({
+        id: uid(), name: r.name || "Recurring",
+        amount: Number(r.amount) || 0,
+        day: Math.min(31, Math.max(1, Number(r.dayOfMonth) || 1)),
+        accountId: d.accounts[0]?.id || "",
+      });
+      return d;
+    });
+    setAddedKeys((k) => [...k, i]);
+  };
+
   const importBills = () => {
     patch((d) => {
       const accId = d.accounts[0]?.id || "";
-      recurringMonthly.forEach((r) => {
+      (result?.recurring || []).forEach((r, idx) => {
+        if (r.cadence !== "monthly" || addedKeys.includes(idx)) return;
         d.bills.push({
           id: uid(), name: r.name || "Recurring",
           amount: Number(r.amount) || 0,
@@ -1435,15 +1552,40 @@ function StatementAnalyser({ data, patch }) {
                       </PieChart>
                     </ResponsiveContainer>
                   </div>
-                  <ul className="mt-1 space-y-1.5">
-                    {cat.map((c, i) => (
-                      <li key={i} className="flex items-center justify-between text-sm">
-                        <span className="flex items-center gap-2 text-slate-600">
-                          <Dot color={CATEGORY_COLOURS[c.category] || fallback[i % 8]} /> {c.category}
-                        </span>
-                        <span className="font-semibold tabular-nums text-slate-900">{gbp(c.amount)}</span>
-                      </li>
-                    ))}
+                  <ul className="mt-1 space-y-1">
+                    {cat.map((c, i) => {
+                      const items = c.items || [];
+                      const isOpen = expandedCat === c.category;
+                      return (
+                        <li key={i}>
+                          <button
+                            onClick={() => setExpandedCat(isOpen ? null : c.category)}
+                            className="flex w-full items-center justify-between rounded-lg px-1.5 py-1 text-sm transition hover:bg-stone-50"
+                          >
+                            <span className="flex items-center gap-2 text-slate-600">
+                              <Dot color={CATEGORY_COLOURS[c.category] || fallback[i % 8]} /> {c.category}
+                              {items.length > 0 && (
+                                <ChevronDown size={14} className={`text-slate-400 transition ${isOpen ? "rotate-180" : ""}`} />
+                              )}
+                            </span>
+                            <span className="font-semibold tabular-nums text-slate-900">{gbp(c.amount)}</span>
+                          </button>
+                          {isOpen && items.length > 0 && (
+                            <ul className="mb-1 ml-4 mt-1 space-y-1 border-l border-stone-200 pl-3">
+                              {items.map((it, j) => (
+                                <li key={j} className="flex items-start justify-between gap-2 text-xs">
+                                  <span className="min-w-0 flex-1 truncate text-slate-500">
+                                    {it.description}
+                                    {it.date ? <span className="text-slate-400"> · {it.date}</span> : null}
+                                  </span>
+                                  <span className="shrink-0 tabular-nums text-slate-600">{gbp(it.amount)}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </li>
+                      );
+                    })}
                   </ul>
                 </div>
               )}
@@ -1452,17 +1594,37 @@ function StatementAnalyser({ data, patch }) {
                 <div>
                   <Eyebrow>Recurring &amp; subscriptions</Eyebrow>
                   <ul className="mt-2 space-y-1.5">
-                    {result.recurring.map((r, i) => (
-                      <li key={i} className="flex items-center justify-between gap-2 rounded-xl border border-stone-100 px-3 py-2">
-                        <div className="min-w-0">
-                          <p className="truncate text-sm font-medium text-slate-800">{r.name}</p>
-                          <p className="text-xs text-slate-400">
-                            {r.cadence}{r.type === "subscription" ? " · subscription" : ""}
-                          </p>
-                        </div>
-                        <span className="text-sm font-bold tabular-nums text-slate-900">{gbp(r.amount)}</span>
-                      </li>
-                    ))}
+                    {result.recurring.map((r, i) => {
+                      const isMonthly = r.cadence === "monthly";
+                      const isAdded = addedKeys.includes(i) || (imported && isMonthly);
+                      return (
+                        <li key={i} className="flex items-center justify-between gap-2 rounded-xl border border-stone-100 px-3 py-2">
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-medium text-slate-800">{r.name}</p>
+                            <p className="text-xs text-slate-400">
+                              {r.cadence}{r.type === "subscription" ? " · subscription" : ""}
+                            </p>
+                          </div>
+                          <div className="flex shrink-0 items-center gap-2">
+                            <span className="text-sm font-bold tabular-nums text-slate-900">{gbp(r.amount)}</span>
+                            {isMonthly && (
+                              isAdded ? (
+                                <span className="flex items-center gap-1 text-xs font-medium text-teal-600">
+                                  <Check size={13} /> Added
+                                </span>
+                              ) : (
+                                <button
+                                  onClick={() => addOne(r, i)}
+                                  className="flex items-center gap-1 rounded-lg border border-teal-200 bg-teal-50 px-2 py-1 text-xs font-medium text-teal-700 transition hover:bg-teal-100"
+                                >
+                                  <Plus size={13} /> Add
+                                </button>
+                              )
+                            )}
+                          </div>
+                        </li>
+                      );
+                    })}
                   </ul>
                   {recurringMonthly.length > 0 && (
                     imported ? (
@@ -1525,6 +1687,7 @@ function Spend({ data, acctById, spentThisMonth, patch }) {
   const [date, setDate] = useState(localISO());
   const [note, setNote] = useState("");
   const [subtract, setSubtract] = useState(true);
+  const [editing, setEditing] = useState(null);
 
   const srcKind = srcVal.startsWith("c:") ? "card" : "account";
   const srcId = srcVal.slice(2);
@@ -1675,6 +1838,7 @@ function Spend({ data, acctById, spentThisMonth, patch }) {
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-bold tabular-nums text-slate-900">{gbp(t.amount)}</span>
+                    <EditBtn onClick={() => setEditing({ ...t, src: t.isCard ? `c:${t.accountId}` : `a:${t.accountId}` })} />
                     <button onClick={() => remove(t)} className="text-slate-300 hover:text-rose-500">
                       <Trash2 size={15} />
                     </button>
@@ -1685,6 +1849,45 @@ function Spend({ data, acctById, spentThisMonth, patch }) {
           </ul>
         )}
       </Card>
+
+      {editing && (
+        <EditModal
+          title="Edit transaction"
+          item={editing}
+          fields={[
+            { key: "note", label: "Note", type: "text" },
+            { key: "amount", label: "Amount (£)", type: "money" },
+            { key: "category", label: "Category", type: "select", options: CATEGORIES.map((c) => ({ value: c, label: c })) },
+            { key: "src", label: "Paid with", type: "select", options: [
+              ...data.accounts.map((a) => ({ value: `a:${a.id}`, label: a.name })),
+              ...cards.map((c) => ({ value: `c:${c.id}`, label: `${c.name} (card)` })),
+            ] },
+          ]}
+          onClose={() => setEditing(null)}
+          onSave={(vals) => {
+            patch((d) => {
+              const t = d.transactions.find((x) => x.id === editing.id);
+              if (!t) return d;
+              // reverse the old balance effect
+              if (t.applied) {
+                if (t.isCard) { const c = (d.cards || []).find((x) => x.id === t.accountId); if (c) c.balance = (c.balance || 0) - t.amount; }
+                else { const a = d.accounts.find((x) => x.id === t.accountId); if (a) a.balance = balanceOf(a) + t.amount; }
+              }
+              const newIsCard = String(vals.src).startsWith("c:");
+              const newId = String(vals.src).slice(2);
+              t.amount = vals.amount; t.category = vals.category; t.note = vals.note;
+              t.accountId = newId; t.isCard = newIsCard;
+              // re-apply with the new amount / destination
+              if (t.applied) {
+                if (newIsCard) { const c = (d.cards || []).find((x) => x.id === newId); if (c) c.balance = (c.balance || 0) + t.amount; }
+                else { const a = d.accounts.find((x) => x.id === newId); if (a) a.balance = balanceOf(a) - t.amount; }
+              }
+              return d;
+            });
+            setEditing(null);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -1693,7 +1896,7 @@ function Spend({ data, acctById, spentThisMonth, patch }) {
 /*  LOANS — generic list                                              */
 /* ------------------------------------------------------------------ */
 
-function LoanList({ loans, accounts, onAdd, onDelete, onLogPayment, onDeletePayment, emptyText }) {
+function LoanList({ loans, accounts, onAdd, onDelete, onLogPayment, onDeletePayment, onEdit, emptyText }) {
   const acctById = useMemo(() => {
     const m = {};
     accounts.forEach((a) => (m[a.id] = a));
@@ -1706,6 +1909,7 @@ function LoanList({ loans, accounts, onAdd, onDelete, onLogPayment, onDeletePaym
   const [monthly, setMonthly] = useState("");
   const [apr, setApr] = useState("");
   const [accountId, setAccountId] = useState(accounts[0]?.id || "");
+  const [editing, setEditing] = useState(null);
 
   const add = () => {
     const orig = parseFloat(original);
@@ -1789,9 +1993,12 @@ function LoanList({ loans, accounts, onAdd, onDelete, onLogPayment, onDeletePaym
                     </p>
                   )}
                 </div>
-                <button onClick={() => onDelete(l.id)} className="text-slate-300 hover:text-rose-500">
-                  <Trash2 size={16} />
-                </button>
+                <div className="flex shrink-0 items-center gap-1">
+                  <EditBtn onClick={() => setEditing(l)} />
+                  <button onClick={() => onDelete(l.id)} className="text-slate-300 hover:text-rose-500">
+                    <Trash2 size={16} />
+                  </button>
+                </div>
               </div>
 
               <div className="mt-3 flex items-end justify-between">
@@ -1846,6 +2053,22 @@ function LoanList({ loans, accounts, onAdd, onDelete, onLogPayment, onDeletePaym
           );
         })
       )}
+
+      {editing && (
+        <EditModal
+          title="Edit loan / debt"
+          item={editing}
+          fields={[
+            { key: "name", label: "Name", type: "text" },
+            { key: "original", label: "Balance owed (£)", type: "money" },
+            { key: "monthly", label: "Monthly payment (£)", type: "money" },
+            { key: "apr", label: "Interest rate (APR %)", type: "percent" },
+            { key: "accountId", label: "Paid from", type: "select", options: accounts.map((a) => ({ value: a.id, label: a.name })) },
+          ]}
+          onClose={() => setEditing(null)}
+          onSave={(vals) => { onEdit(editing.id, vals); setEditing(null); }}
+        />
+      )}
     </div>
   );
 }
@@ -1871,6 +2094,11 @@ function LoansTab({ data, drawnThisMonth, patch }) {
     if (l) l.payments = l.payments.filter((x) => x.id !== pid);
     return d;
   });
+  const pEdit = (id, vals) => patch((d) => {
+    const l = d.loans.find((x) => x.id === id);
+    if (l) { l.name = vals.name; l.original = vals.original; l.monthly = vals.monthly; l.apr = vals.apr; l.accountId = vals.accountId; }
+    return d;
+  });
 
   /* business loan handlers */
   const bAdd = (loan) => patch((d) => { d.business.loans.push(loan); return d; });
@@ -1885,6 +2113,11 @@ function LoansTab({ data, drawnThisMonth, patch }) {
     if (l) l.payments = l.payments.filter((x) => x.id !== pid);
     return d;
   });
+  const bEdit = (id, vals) => patch((d) => {
+    const l = d.business.loans.find((x) => x.id === id);
+    if (l) { l.name = vals.name; l.original = vals.original; l.monthly = vals.monthly; l.apr = vals.apr; l.accountId = vals.accountId; }
+    return d;
+  });
 
   /* business accounts handlers */
   const bAcctAdd = (acct) => patch((d) => { d.business.accounts.push(acct); return d; });
@@ -1892,6 +2125,11 @@ function LoansTab({ data, drawnThisMonth, patch }) {
   const bAcctBal = (id, val) => patch((d) => {
     const a = d.business.accounts.find((x) => x.id === id);
     if (a) { const n = parseFloat(val); a.balance = Number.isFinite(n) ? n : 0; }
+    return d;
+  });
+  const bAcctEdit = (id, vals) => patch((d) => {
+    const a = d.business.accounts.find((x) => x.id === id);
+    if (a) { a.name = vals.name; a.type = vals.type; a.balance = vals.balance; }
     return d;
   });
 
@@ -2011,6 +2249,7 @@ function LoansTab({ data, drawnThisMonth, patch }) {
             onDelete={pDel}
             onLogPayment={pPay}
             onDeletePayment={pPayDel}
+            onEdit={pEdit}
             emptyText="No personal debts tracked yet. Add one to watch the balance shrink every time you log a payment."
           />
         </>
@@ -2037,6 +2276,7 @@ function LoansTab({ data, drawnThisMonth, patch }) {
             onAdd={bAcctAdd}
             onDelete={bAcctDel}
             onBalance={bAcctBal}
+            onEdit={bAcctEdit}
           />
 
           {/* business loans */}
@@ -2051,6 +2291,7 @@ function LoansTab({ data, drawnThisMonth, patch }) {
               onDelete={bDel}
               onLogPayment={bPay}
               onDeletePayment={bPayDel}
+              onEdit={bEdit}
               emptyText="No business loans tracked yet. Add your equipment finance, asset finance and any business loans here."
             />
           </div>
@@ -2062,12 +2303,13 @@ function LoansTab({ data, drawnThisMonth, patch }) {
   );
 }
 
-function BusinessAccounts({ accounts, onAdd, onDelete, onBalance }) {
+function BusinessAccounts({ accounts, onAdd, onDelete, onBalance, onEdit }) {
   const [open, setOpen] = useState(accounts.length === 0);
   const [name, setName] = useState("");
   const [type, setType] = useState("Current");
   const [color, setColor] = useState(ACCOUNT_COLORS[4]);
   const [balance, setBalance] = useState("");
+  const [editing, setEditing] = useState(null);
 
   const add = () => {
     if (!name.trim()) return;
@@ -2091,9 +2333,12 @@ function BusinessAccounts({ accounts, onAdd, onDelete, onBalance }) {
                     <p className="text-xs text-slate-400">{a.type}</p>
                   </div>
                 </div>
-                <button onClick={() => onDelete(a.id)} className="text-slate-300 hover:text-rose-500">
-                  <Trash2 size={16} />
-                </button>
+                <div className="flex items-center gap-1">
+                  <EditBtn onClick={() => setEditing(a)} />
+                  <button onClick={() => onDelete(a.id)} className="text-slate-300 hover:text-rose-500">
+                    <Trash2 size={16} />
+                  </button>
+                </div>
               </div>
               <div className="mt-2 flex items-center gap-2">
                 <span className="text-sm font-medium text-slate-400">£</span>
@@ -2141,6 +2386,20 @@ function BusinessAccounts({ accounts, onAdd, onDelete, onBalance }) {
           <Plus size={15} /> Add a business account
         </button>
       )}
+
+      {editing && (
+        <EditModal
+          title="Edit account"
+          item={editing}
+          fields={[
+            { key: "name", label: "Account name", type: "text" },
+            { key: "type", label: "Type", type: "select", options: ["Current", "Savings", "Other"].map((t) => ({ value: t, label: t })) },
+            { key: "balance", label: "Balance now (£)", type: "money" },
+          ]}
+          onClose={() => setEditing(null)}
+          onSave={(vals) => { onEdit(editing.id, vals); setEditing(null); }}
+        />
+      )}
     </Card>
   );
 }
@@ -2157,6 +2416,7 @@ function CardsSection({ cards, accounts, patch }) {
   const [apr, setApr] = useState("");
   const [minPayment, setMinPayment] = useState("");
   const [color, setColor] = useState(ACCOUNT_COLORS[6]);
+  const [editing, setEditing] = useState(null);
 
   const addCard = () => {
     if (!name.trim()) return;
@@ -2267,13 +2527,36 @@ function CardsSection({ cards, accounts, patch }) {
 
       {cards.map((c) => (
         <CardItem key={c.id} card={c} accounts={accounts}
-          onPay={payCard} onDelete={delCard} onDeletePayment={delPayment} />
+          onPay={payCard} onDelete={delCard} onDeletePayment={delPayment} onEdit={() => setEditing(c)} />
       ))}
+
+      {editing && (
+        <EditModal
+          title="Edit card"
+          item={editing}
+          fields={[
+            { key: "name", label: "Card name", type: "text" },
+            { key: "balance", label: "Balance owed (£)", type: "money" },
+            { key: "limit", label: "Credit limit (£)", type: "money" },
+            { key: "apr", label: "APR (%)", type: "percent" },
+            { key: "minPayment", label: "Min payment (£)", type: "money" },
+          ]}
+          onClose={() => setEditing(null)}
+          onSave={(vals) => {
+            patch((d) => {
+              const c = (d.cards || []).find((x) => x.id === editing.id);
+              if (c) { c.name = vals.name; c.balance = vals.balance; c.limit = vals.limit; c.apr = vals.apr; c.minPayment = vals.minPayment; }
+              return d;
+            });
+            setEditing(null);
+          }}
+        />
+      )}
     </div>
   );
 }
 
-function CardItem({ card: c, accounts, onPay, onDelete, onDeletePayment }) {
+function CardItem({ card: c, accounts, onPay, onDelete, onDeletePayment, onEdit }) {
   const [payOpen, setPayOpen] = useState(false);
   const [payAmt, setPayAmt] = useState(String(c.minPayment || ""));
   const [payFrom, setPayFrom] = useState(accounts[0]?.id || "");
@@ -2307,9 +2590,12 @@ function CardItem({ card: c, accounts, onPay, onDelete, onDeletePayment }) {
             <p className="text-xs text-slate-400">{c.apr > 0 ? `${c.apr}% APR` : "no APR set"}</p>
           </div>
         </div>
-        <button onClick={() => onDelete(c.id)} className="text-slate-300 hover:text-rose-500">
-          <Trash2 size={16} />
-        </button>
+        <div className="flex shrink-0 items-center gap-1">
+          <EditBtn onClick={onEdit} />
+          <button onClick={() => onDelete(c.id)} className="text-slate-300 hover:text-rose-500">
+            <Trash2 size={16} />
+          </button>
+        </div>
       </div>
 
       <div className="mt-3 flex items-end justify-between">
@@ -2402,6 +2688,7 @@ function Setup({ data, patch, onReset, onExample, householdCode, onSignOut }) {
   const [reserveStr, setReserveStr] = useState(String(data.reserve || ""));
   const [confirmExample, setConfirmExample] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [editingAcct, setEditingAcct] = useState(null);
   const businessOn = data.businessEnabled !== false;
 
   const addAccount = () => {
@@ -2510,12 +2797,15 @@ function Setup({ data, patch, onReset, onExample, householdCode, onSignOut }) {
                       <p className="text-xs text-slate-400">{a.type}</p>
                     </div>
                   </div>
-                  <button
-                    onClick={() => patch((d) => { d.accounts = d.accounts.filter((x) => x.id !== a.id); return d; })}
-                    className="text-slate-300 hover:text-rose-500"
-                  >
-                    <Trash2 size={16} />
-                  </button>
+                  <div className="flex items-center gap-1">
+                    <EditBtn onClick={() => setEditingAcct(a)} />
+                    <button
+                      onClick={() => patch((d) => { d.accounts = d.accounts.filter((x) => x.id !== a.id); return d; })}
+                      className="text-slate-300 hover:text-rose-500"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
                 </div>
                 <div className="mt-2 flex items-center gap-2">
                   <span className="text-sm font-medium text-slate-400">£</span>
@@ -2558,6 +2848,27 @@ function Setup({ data, patch, onReset, onExample, householdCode, onSignOut }) {
           </button>
         </div>
       </Card>
+
+      {editingAcct && (
+        <EditModal
+          title="Edit account"
+          item={editingAcct}
+          fields={[
+            { key: "name", label: "Account name", type: "text" },
+            { key: "type", label: "Type", type: "select", options: ["Current", "Savings", "Credit", "Other"].map((t) => ({ value: t, label: t })) },
+            { key: "balance", label: "Balance now (£)", type: "money" },
+          ]}
+          onClose={() => setEditingAcct(null)}
+          onSave={(vals) => {
+            patch((d) => {
+              const a = d.accounts.find((x) => x.id === editingAcct.id);
+              if (a) { a.name = vals.name; a.type = vals.type; a.balance = vals.balance; }
+              return d;
+            });
+            setEditingAcct(null);
+          }}
+        />
+      )}
 
       {/* calendar reminders */}
       <Card>
