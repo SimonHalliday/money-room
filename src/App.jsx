@@ -467,6 +467,15 @@ function CheckToggle({ checked, onChange, label }) {
 /*  App                                                                */
 /* ------------------------------------------------------------------ */
 
+const NAV = [
+  { id: "home", label: "Today", icon: Wallet },
+  { id: "income", label: "Income", icon: Banknote },
+  { id: "bills", label: "Bills", icon: CalendarClock },
+  { id: "spend", label: "Spend", icon: ShoppingBag },
+  { id: "loans", label: "Debt", icon: Landmark },
+  { id: "setup", label: "More", icon: Settings2 },
+];
+
 function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
   const [tab, setTab] = useState(() => {
     try { return localStorage.getItem("mr_tab") || "home"; } catch { return "home"; }
@@ -579,7 +588,35 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
 
   return (
     <div className="min-h-screen bg-stone-50 text-slate-800">
-      <div className="mx-auto max-w-md px-4 pb-28 pt-6">
+      <div className="mx-auto flex w-full max-w-5xl">
+        <aside className="sticky top-0 hidden h-screen w-56 shrink-0 flex-col border-r border-stone-200 bg-white/50 px-3 py-6 lg:flex">
+          <div className="mb-6 flex items-center gap-2 px-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-teal-600 text-white">
+              <Wallet size={18} />
+            </div>
+            <span className="text-base font-bold tracking-tight text-slate-800">The Money Room</span>
+          </div>
+          <nav className="flex flex-col gap-1">
+            {NAV.filter((t) => businessOn || t.id !== "income").map((t) => {
+              const Active = tab === t.id;
+              const Icon = t.icon;
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => setTab(t.id)}
+                  className={`flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition ${
+                    Active ? "bg-teal-50 text-teal-700" : "text-slate-500 hover:bg-stone-100 hover:text-slate-700"
+                  }`}
+                >
+                  <Icon size={19} strokeWidth={Active ? 2.4 : 1.8} />
+                  {t.label}
+                </button>
+              );
+            })}
+          </nav>
+        </aside>
+
+        <div className="mx-auto w-full max-w-md px-4 pb-28 pt-6 lg:mx-0 lg:max-w-3xl lg:flex-1 lg:px-8 lg:pb-12">
         <header className="mb-5 flex items-center justify-between">
           <div>
             <Eyebrow>Money, made glanceable</Eyebrow>
@@ -650,18 +687,12 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
             )}
           </>
         )}
+        </div>
       </div>
 
-      <nav className="fixed inset-x-0 bottom-0 z-10 border-t border-stone-200 bg-white">
+      <nav className="fixed inset-x-0 bottom-0 z-10 border-t border-stone-200 bg-white lg:hidden">
         <div className="mx-auto flex max-w-md items-stretch justify-between px-1">
-          {[
-            { id: "home", label: "Today", icon: Wallet },
-            { id: "income", label: "Income", icon: Banknote },
-            { id: "bills", label: "Bills", icon: CalendarClock },
-            { id: "spend", label: "Spend", icon: ShoppingBag },
-            { id: "loans", label: "Debt", icon: Landmark },
-            { id: "setup", label: "More", icon: Settings2 },
-          ].filter((t) => businessOn || t.id !== "income").map((t) => {
+          {NAV.filter((t) => businessOn || t.id !== "income").map((t) => {
             const Active = tab === t.id;
             const Icon = t.icon;
             return (
