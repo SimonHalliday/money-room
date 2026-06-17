@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import {
   PieChart, Pie, Cell, ResponsiveContainer, Tooltip,
+  AreaChart, Area, XAxis, YAxis, ReferenceLine,
 } from "recharts";
 import * as pdfjsLib from "pdfjs-dist";
 
@@ -48,14 +49,14 @@ const DRAW_TYPE_COLOURS = {
   "Other": "#a8a29e",
 };
 
-const ANALYSIS_PROMPT =
+const analysisPrompt = (cats) =>
   'You are analysing a personal bank statement. Read the statement data and reply with ONLY a single minified JSON object — no markdown, no backticks, no commentary — in exactly this shape: ' +
   '{"currency":"GBP","period":"<human date range or empty string>","totalIn":<number>,"totalOut":<number>,' +
-  '"byCategory":[{"category":"<Groceries|Eating out|Fuel / transport|Shopping|Subscriptions|Bills & utilities|Cash|Transfers|Health|Kids|Home|Fun|Other>","amount":<number>,"items":[{"description":"<payee>","amount":<number>,"date":"<DD Mon or empty>"}]}],' +
+  '"byCategory":[{"category":"<' + cats.join("|") + '>","amount":<number>,"items":[{"description":"<payee>","amount":<number>,"date":"<DD Mon or empty>"}]}],' +
   '"recurring":[{"name":"<payee>","amount":<number>,"cadence":"monthly|weekly|annual","type":"bill|subscription","dayOfMonth":<1-31 or null>}],' +
   '"largest":[{"description":"<payee>","amount":<number>,"date":"<DD Mon or empty>"}],' +
   '"insights":["<short plain-English note>"]}. ' +
-  'Rules: all amounts are positive plain numbers in pounds, no symbols. byCategory covers money going OUT only, top 8 by amount, and each category includes an items array listing every individual transaction in it (description, amount, date). ' +
+  'Rules: all amounts are positive plain numbers in pounds, no symbols. Use ONLY these categories and nothing else: ' + cats.join(", ") + '. If a transaction does not clearly fit one, choose the closest of those. byCategory covers money going OUT only, top 8 by amount, and each category includes an items array listing every individual transaction in it (description, amount, date). ' +
   'recurring lists payments that look like they repeat (direct debits, standing orders, subscriptions), up to 10, with a best-guess cadence and a day-of-month if monthly. ' +
   'largest lists the top 5 one-off outgoings. insights gives 3 to 5 friendly, practical notes for someone managing money with ADHD — flag subscriptions they may not need, categories higher than expected, or simple wins. Be encouraging, never preachy or shaming. If a value is unknown use 0 or "". Output JSON only.';
 
@@ -70,6 +71,7 @@ const EMPTY = {
   reserve: 0,
   business: { accounts: [], loans: [] },
   businessEnabled: true,
+  categories: [...CATEGORIES],
 };
 
 /* ------------------------------------------------------------------ */
@@ -113,6 +115,46 @@ function daysUntil(date) {
   const t = new Date();
   t.setHours(0, 0, 0, 0);
   return Math.round((date - t) / 86400000);
+}
+
+// Project the running account balance forward, subtracting bills on the days they fall due.
+// Returns the daily points plus the lowest point and the date it happens.
+function buildProjection(startBalance, bills, days = 42) {
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const lastOf = (yy, mm) => new Date(yy, mm + 1, 0).getDate();
+  const end = new Date(today); end.setDate(today.getDate() + days);
+  const dropByOffset = {};
+  (bills || []).forEach((b) => {
+    const amt = Number(b.amount) || 0;
+    const dom = Number(b.day) || 0;
+    if (!amt || !dom) return;
+    for (let k = 0; k <= 2; k++) {
+      const yy = today.getFullYear();
+      const mm = today.getMonth() + k;
+      const due = new Date(yy, mm, Math.min(dom, lastOf(yy, mm)));
+      if (due >= today && due <= end) {
+        const off = Math.round((due - today) / 86400000);
+        dropByOffset[off] = (dropByOffset[off] || 0) + amt;
+      }
+    }
+  });
+  const points = [];
+  let bal = startBalance;
+  let low = startBalance;
+  let lowOff = 0;
+  for (let i = 0; i <= days; i++) {
+    if (i > 0 && dropByOffset[i]) bal -= dropByOffset[i];
+    if (bal < low) { low = bal; lowOff = i; }
+    const d = new Date(today); d.setDate(today.getDate() + i);
+    points.push({
+      off: i,
+      label: d.toLocaleDateString("en-GB", { day: "numeric", month: "short" }),
+      balance: Math.round(bal * 100) / 100,
+      drop: dropByOffset[i] || 0,
+    });
+  }
+  const lowDate = new Date(today); lowDate.setDate(today.getDate() + lowOff);
+  return { points, low: Math.round(low * 100) / 100, lowDate, lowOff };
 }
 
 function isThisMonth(iso) {
@@ -471,6 +513,10 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
   const reserve = Number.isFinite(data.reserve) ? data.reserve : 0;
   const projected = safeToSpend; /* balance after this month's remaining outgoings */
   const shortfall = reserve - projected; /* >0 means below reserve */
+  const projection = useMemo(
+    () => buildProjection(balancesTotal, data.bills, 42),
+    [balancesTotal, data.bills]
+  );
 
   /* ---- draws ---- */
   const monthDraws = useMemo(
@@ -556,6 +602,7 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
                 earmarked={earmarked}
                 hasBalances={hasBalances}
                 reserve={reserve}
+                projection={projection}
                 projected={projected}
                 shortfall={shortfall}
                 nudges={nudges}
@@ -670,7 +717,7 @@ function FirstRun({ onSetup, onExample }) {
 
 function Home({
   safeToSpend, balancesTotal, remainingThisMonth, earmarked, hasBalances,
-  reserve, projected, shortfall, nudges, pots, onAddPot, onDeletePot, onMovePot,
+  reserve, projection, projected, shortfall, nudges, pots, onAddPot, onDeletePot, onMovePot,
   drawnThisMonth, drawsByType, committedMonthly, billsTotal, loansMonthly,
   upcoming, perAccount, acctById, onGoSetup, onGoIncome, businessOn,
 }) {
@@ -712,6 +759,59 @@ function Home({
           </>
         )}
       </div>
+
+      {/* The month ahead — forward projection */}
+      {hasBalances && projection && projection.points.some((p) => p.drop > 0) && (
+        <Card>
+          <div className="flex items-baseline justify-between">
+            <Eyebrow>The month ahead</Eyebrow>
+            <span className="text-xs text-slate-400">next 6 weeks</span>
+          </div>
+          <p className="mb-3 mt-1 text-sm text-slate-500">
+            Your balance as upcoming bills come off — so you can see the dips before they land.
+          </p>
+          <div className="h-40 w-full">
+            <ResponsiveContainer>
+              <AreaChart data={projection.points} margin={{ top: 6, right: 8, bottom: 0, left: 8 }}>
+                <defs>
+                  <linearGradient id="projFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#0d9488" stopOpacity={0.22} />
+                    <stop offset="100%" stopColor="#0d9488" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <XAxis dataKey="label" tick={{ fontSize: 10, fill: "#94a3b8" }} tickLine={false}
+                  axisLine={false} interval="preserveStartEnd" minTickGap={30} />
+                <YAxis hide domain={[(dMin) => Math.min(dMin, reserve > 0 ? reserve : dMin), "dataMax"]} />
+                <Tooltip formatter={(v) => [gbp(v), "Balance"]} />
+                {reserve > 0 && <ReferenceLine y={reserve} stroke="#f59e0b" strokeDasharray="4 4" strokeWidth={1.5} />}
+                <Area type="monotone" dataKey="balance" stroke="#0d9488" strokeWidth={2.5} fill="url(#projFill)" />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+          {(() => {
+            const low = projection.low;
+            const belowReserve = reserve > 0 && low < reserve;
+            const tone = low < 0 ? "rose" : belowReserve ? "amber" : "teal";
+            const cls = tone === "rose" ? "bg-rose-50 text-rose-700"
+              : tone === "amber" ? "bg-amber-50 text-amber-800" : "bg-teal-50 text-teal-800";
+            const when = projection.lowOff === 0
+              ? "right now"
+              : `around ${projection.lowDate.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}`;
+            return (
+              <div className={`mt-3 flex items-start gap-2 rounded-xl px-3 py-2.5 text-sm ${cls}`}>
+                {tone === "teal" ? <Check size={16} className="mt-0.5 shrink-0" /> : <AlertTriangle size={16} className="mt-0.5 shrink-0" />}
+                <span>
+                  Lowest point: <span className="font-semibold tabular-nums">{gbp(low)}</span> {when}
+                  {reserve > 0 && (belowReserve
+                    ? ` — ${gbp0(reserve - low)} under your ${gbp0(reserve)} safety net.`
+                    : ` — comfortably above your ${gbp0(reserve)} safety net.`)}
+                  {reserve <= 0 && "."}
+                </span>
+              </div>
+            );
+          })()}
+        </Card>
+      )}
 
       {/* Needs you — auto nudges */}
       {hasBalances && (
@@ -1241,6 +1341,65 @@ function Income({
 /*  BILLS                                                              */
 /* ------------------------------------------------------------------ */
 
+// A simple month grid showing which days bills land on, with the day's total.
+function BillCalendar({ bills }) {
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const y = today.getFullYear();
+  const m = today.getMonth();
+  const first = new Date(y, m, 1);
+  const daysInMonth = new Date(y, m + 1, 0).getDate();
+  const startWeekday = (first.getDay() + 6) % 7; // Monday-first
+  const byDay = {};
+  (bills || []).forEach((b) => {
+    const d = Number(b.day) || 0;
+    const amt = Number(b.amount) || 0;
+    if (!d || !amt) return;
+    const dd = Math.min(d, daysInMonth);
+    byDay[dd] = (byDay[dd] || 0) + amt;
+  });
+  const cells = [];
+  for (let i = 0; i < startWeekday; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+  const monthLabel = first.toLocaleDateString("en-GB", { month: "long", year: "numeric" });
+  const monthTotal = Object.values(byDay).reduce((s, v) => s + v, 0);
+  const weekdays = ["M", "T", "W", "T", "F", "S", "S"];
+  return (
+    <Card>
+      <div className="flex items-baseline justify-between">
+        <Eyebrow>Bill calendar</Eyebrow>
+        <span className="text-xs text-slate-400">{monthLabel}</span>
+      </div>
+      <div className="mt-3 grid grid-cols-7 gap-1 text-center">
+        {weekdays.map((w, i) => (
+          <div key={`h${i}`} className="pb-1 text-[10px] font-semibold uppercase text-slate-400">{w}</div>
+        ))}
+        {cells.map((d, i) => {
+          if (d === null) return <div key={i} />;
+          const amt = byDay[d];
+          const isToday = d === today.getDate();
+          const isPast = d < today.getDate();
+          return (
+            <div
+              key={i}
+              className={`flex min-h-[40px] flex-col items-center justify-start rounded-lg px-0.5 py-1 ${amt ? (isPast ? "bg-stone-100" : "bg-teal-50") : ""} ${isToday ? "ring-1 ring-teal-500" : ""}`}
+            >
+              <span className={`text-xs ${isToday ? "font-bold text-teal-700" : isPast ? "text-slate-400" : "text-slate-600"}`}>{d}</span>
+              {amt ? (
+                <span className={`mt-0.5 text-[9px] font-semibold leading-none ${isPast ? "text-slate-400" : "text-teal-700"}`}>{gbp0(amt)}</span>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+      {monthTotal > 0 && (
+        <p className="mt-3 text-center text-xs text-slate-400">
+          {gbp0(monthTotal)} of bills across {first.toLocaleDateString("en-GB", { month: "long" })}
+        </p>
+      )}
+    </Card>
+  );
+}
+
 function Bills({ data, acctById, billsTotal, patch }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
@@ -1269,6 +1428,8 @@ function Bills({ data, acctById, billsTotal, patch }) {
     <div className="space-y-4">
       <SummaryBar label="Regular bills, every month" value={billsTotal}
         sub={`${data.bills.length} bill${data.bills.length === 1 ? "" : "s"}`} />
+
+      {data.bills.length > 0 && <BillCalendar bills={data.bills} />}
 
       {!open ? (
         <button onClick={() => setOpen(true)} className={`${btnPrimary} w-full`}>
@@ -1458,7 +1619,7 @@ function StatementAnalyser({ data, patch }) {
         content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: pdfBase64 } });
       }
       const tail = pdfBase64 ? "The bank statement is attached as a PDF." : `Bank statement data:\n\n${text.slice(0, 100000)}`;
-      content.push({ type: "text", text: ANALYSIS_PROMPT + "\n\n" + tail });
+      content.push({ type: "text", text: analysisPrompt(data.categories?.length ? data.categories : CATEGORIES) + "\n\n" + tail });
       const res = await fetch("/.netlify/functions/analyse-statement", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1706,9 +1867,10 @@ function StatementAnalyser({ data, patch }) {
 
 function Spend({ data, acctById, spentThisMonth, patch }) {
   const cards = data.cards || [];
+  const cats = data.categories?.length ? data.categories : CATEGORIES;
   const firstSrc = data.accounts[0] ? `a:${data.accounts[0].id}` : cards[0] ? `c:${cards[0].id}` : "";
   const [amount, setAmount] = useState("");
-  const [category, setCategory] = useState(CATEGORIES[0]);
+  const [category, setCategory] = useState(cats[0]);
   const [srcVal, setSrcVal] = useState(firstSrc);
   const [date, setDate] = useState(localISO());
   const [note, setNote] = useState("");
@@ -1791,7 +1953,7 @@ function Spend({ data, acctById, spentThisMonth, patch }) {
           </div>
           <Field label="Category">
             <select className={inputCls} value={category} onChange={(e) => setCategory(e.target.value)}>
-              {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+              {cats.map((c) => <option key={c} value={c}>{c}</option>)}
             </select>
           </Field>
           <Field label="Paid with">
@@ -1825,17 +1987,17 @@ function Spend({ data, acctById, spentThisMonth, patch }) {
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
                 <Pie data={byCat} dataKey="value" nameKey="name" innerRadius={52} outerRadius={80} paddingAngle={2} stroke="none">
-                  {byCat.map((e) => <Cell key={e.name} fill={CATEGORY_COLOURS[e.name] || "#94a3b8"} />)}
+                  {byCat.map((e, i) => <Cell key={e.name} fill={CATEGORY_COLOURS[e.name] || ACCOUNT_COLORS[i % ACCOUNT_COLORS.length]} />)}
                 </Pie>
                 <Tooltip formatter={(v) => gbp(v)} />
               </PieChart>
             </ResponsiveContainer>
           </div>
           <ul className="mt-2 space-y-2">
-            {byCat.map((c) => (
+            {byCat.map((c, i) => (
               <li key={c.name} className="flex items-center justify-between text-sm">
                 <span className="flex items-center gap-2 text-slate-600">
-                  <Dot color={CATEGORY_COLOURS[c.name] || "#94a3b8"} /> {c.name}
+                  <Dot color={CATEGORY_COLOURS[c.name] || ACCOUNT_COLORS[i % ACCOUNT_COLORS.length]} /> {c.name}
                 </span>
                 <span className="font-semibold tabular-nums text-slate-900">{gbp(c.value)}</span>
               </li>
@@ -1883,7 +2045,7 @@ function Spend({ data, acctById, spentThisMonth, patch }) {
           fields={[
             { key: "note", label: "Note", type: "text" },
             { key: "amount", label: "Amount (£)", type: "money" },
-            { key: "category", label: "Category", type: "select", options: CATEGORIES.map((c) => ({ value: c, label: c })) },
+            { key: "category", label: "Category", type: "select", options: cats.map((c) => ({ value: c, label: c })) },
             { key: "src", label: "Paid with", type: "select", options: [
               ...data.accounts.map((a) => ({ value: `a:${a.id}`, label: a.name })),
               ...cards.map((c) => ({ value: `c:${c.id}`, label: `${c.name} (card)` })),
@@ -2715,6 +2877,8 @@ function Setup({ data, patch, onReset, onExample, householdCode, onSignOut }) {
   const [confirmExample, setConfirmExample] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [editingAcct, setEditingAcct] = useState(null);
+  const [newCat, setNewCat] = useState("");
+  const [editingCat, setEditingCat] = useState(null);
   const businessOn = data.businessEnabled !== false;
 
   const addAccount = () => {
@@ -2742,6 +2906,34 @@ function Setup({ data, patch, onReset, onExample, householdCode, onSignOut }) {
   const saveReserve = () => {
     const v = parseFloat(reserveStr);
     patch((d) => { d.reserve = Number.isFinite(v) ? v : 0; return d; });
+  };
+
+  const cats = data.categories?.length ? data.categories : CATEGORIES;
+  const addCat = () => {
+    const name = newCat.trim();
+    if (!name) return;
+    patch((d) => {
+      if (!Array.isArray(d.categories) || !d.categories.length) d.categories = [...CATEGORIES];
+      if (!d.categories.some((c) => c.toLowerCase() === name.toLowerCase())) d.categories.push(name);
+      return d;
+    });
+    setNewCat("");
+  };
+  const removeCat = (name) => patch((d) => {
+    if (!Array.isArray(d.categories) || !d.categories.length) d.categories = [...CATEGORIES];
+    if (d.categories.length > 1) d.categories = d.categories.filter((c) => c !== name);
+    return d;
+  });
+  const renameCat = (oldName, raw) => {
+    const name = (raw || "").trim();
+    if (!name) return;
+    patch((d) => {
+      if (!Array.isArray(d.categories) || !d.categories.length) d.categories = [...CATEGORIES];
+      const i = d.categories.indexOf(oldName);
+      if (i >= 0 && !d.categories.some((c) => c.toLowerCase() === name.toLowerCase() && c !== oldName)) d.categories[i] = name;
+      (d.transactions || []).forEach((t) => { if (t.category === oldName) t.category = name; });
+      return d;
+    });
   };
 
   return (
@@ -2896,6 +3088,49 @@ function Setup({ data, patch, onReset, onExample, householdCode, onSignOut }) {
         />
       )}
 
+      {/* spending categories */}
+      <Card>
+        <Eyebrow>Spending categories</Eyebrow>
+        <p className="mb-3 mt-1 text-sm text-slate-500">
+          The buckets used when you log spending and when the analyser sorts a statement. Make them yours —
+          add, rename, or remove. Renaming one updates it on your past spending too.
+        </p>
+        <ul className="mb-3 space-y-1.5">
+          {cats.map((c, i) => (
+            <li key={c} className="flex items-center justify-between rounded-xl border border-stone-100 px-3 py-2">
+              <span className="flex min-w-0 items-center gap-2 text-sm text-slate-700">
+                <Dot color={CATEGORY_COLOURS[c] || ACCOUNT_COLORS[i % ACCOUNT_COLORS.length]} />
+                <span className="truncate">{c}</span>
+              </span>
+              <div className="flex shrink-0 items-center gap-1">
+                <EditBtn onClick={() => setEditingCat(c)} />
+                {cats.length > 1 && (
+                  <button onClick={() => removeCat(c)} className="text-slate-300 hover:text-rose-500">
+                    <Trash2 size={16} />
+                  </button>
+                )}
+              </div>
+            </li>
+          ))}
+        </ul>
+        <div className="flex gap-2">
+          <input className={inputCls} placeholder="Add a category…" value={newCat}
+            onChange={(e) => setNewCat(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") addCat(); }} />
+          <button onClick={addCat} className={btnPrimary}><Plus size={16} /></button>
+        </div>
+      </Card>
+
+      {editingCat && (
+        <EditModal
+          title="Rename category"
+          item={{ name: editingCat }}
+          fields={[{ key: "name", label: "Category name", type: "text" }]}
+          onClose={() => setEditingCat(null)}
+          onSave={(vals) => { renameCat(editingCat, vals.name); setEditingCat(null); }}
+        />
+      )}
+
       {/* calendar reminders */}
       <Card>
         <Eyebrow>Bill reminders</Eyebrow>
@@ -3005,6 +3240,7 @@ function normalizeData(parsed) {
   if (!Array.isArray(merged.draws)) merged.draws = [];
   if (!Array.isArray(merged.cards)) merged.cards = [];
   if (!Array.isArray(merged.pots)) merged.pots = [];
+  if (!Array.isArray(merged.categories) || merged.categories.length === 0) merged.categories = [...CATEGORIES];
   if (!Number.isFinite(merged.reserve)) merged.reserve = 0;
   if (typeof merged.businessEnabled !== "boolean") merged.businessEnabled = true;
   return merged;
