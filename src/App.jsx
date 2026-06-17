@@ -537,6 +537,14 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
     () => data.draws.filter((dr) => isThisYear(dr.date)).reduce((s, d) => s + (d.amount || 0), 0),
     [data.draws]
   );
+  const drawnTaxYear = useMemo(() => {
+    const now = new Date();
+    const startYear = (now.getMonth() > 3 || (now.getMonth() === 3 && now.getDate() >= 6)) ? now.getFullYear() : now.getFullYear() - 1;
+    const start = new Date(startYear, 3, 6);
+    return data.draws
+      .filter((dr) => dr.date && new Date(dr.date + "T00:00:00") >= start)
+      .reduce((s, d) => s + (d.amount || 0), 0);
+  }, [data.draws]);
   const drawsByType = useMemo(() => {
     const m = {};
     monthDraws.forEach((d) => (m[d.type] = (m[d.type] || 0) + d.amount));
@@ -648,6 +656,7 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
                 onDeletePot={delPot}
                 onMovePot={movePot}
                 drawnThisMonth={drawnThisMonth}
+                drawnTaxYear={drawnTaxYear}
                 drawsByType={drawsByType}
                 committedMonthly={committedMonthly}
                 billsTotal={billsTotal}
@@ -749,7 +758,7 @@ function FirstRun({ onSetup, onExample }) {
 function Home({
   safeToSpend, balancesTotal, remainingThisMonth, earmarked, hasBalances,
   reserve, projection, projected, shortfall, nudges, pots, onAddPot, onDeletePot, onMovePot,
-  drawnThisMonth, drawsByType, committedMonthly, billsTotal, loansMonthly,
+  drawnThisMonth, drawnTaxYear, drawsByType, committedMonthly, billsTotal, loansMonthly,
   upcoming, perAccount, acctById, onGoSetup, onGoIncome, businessOn,
 }) {
   const monthName = new Date().toLocaleDateString("en-GB", { month: "long" });
@@ -931,7 +940,7 @@ function Home({
       {hasBalances && <AffordCheck safeToSpend={safeToSpend} reserve={reserve} />}
 
       {hasBalances && (
-        <PotsCard pots={pots} earmarked={earmarked}
+        <PotsCard pots={pots} earmarked={earmarked} drawnTaxYear={drawnTaxYear}
           onCreate={onAddPot} onDelete={onDeletePot} onMove={onMovePot} />
       )}
 
@@ -1080,19 +1089,27 @@ function AffordCheck({ safeToSpend, reserve }) {
 /*  SINKING FUNDS / POTS                                               */
 /* ------------------------------------------------------------------ */
 
-function PotsCard({ pots, earmarked, onCreate, onDelete, onMove }) {
+function PotsCard({ pots, earmarked, drawnTaxYear, onCreate, onDelete, onMove }) {
   const [createOpen, setCreateOpen] = useState(false);
+  const [kind, setKind] = useState("goal");
   const [name, setName] = useState("");
   const [target, setTarget] = useState("");
+  const [targetDate, setTargetDate] = useState("");
+  const [rate, setRate] = useState("");
   const [color, setColor] = useState(ACCOUNT_COLORS[2]);
   const [moveId, setMoveId] = useState(pots[0]?.id || "");
   const [moveAmt, setMoveAmt] = useState("");
 
   const create = () => {
-    if (!name.trim()) return;
-    const t = parseFloat(target);
-    onCreate({ id: uid(), name: name.trim(), target: Number.isFinite(t) ? t : 0, saved: 0, color });
-    setName(""); setTarget(""); setCreateOpen(false);
+    if (kind === "tax") {
+      const r = parseFloat(rate);
+      onCreate({ id: uid(), name: name.trim() || "Tax", saved: 0, color, kind: "tax", rate: Number.isFinite(r) ? r : 20 });
+    } else {
+      if (!name.trim()) return;
+      const t = parseFloat(target);
+      onCreate({ id: uid(), name: name.trim(), saved: 0, color, target: Number.isFinite(t) ? t : 0, targetDate: targetDate || "" });
+    }
+    setName(""); setTarget(""); setTargetDate(""); setRate(""); setKind("goal"); setCreateOpen(false);
   };
 
   const move = (sign) => {
@@ -1116,7 +1133,22 @@ function PotsCard({ pots, earmarked, onCreate, onDelete, onMove }) {
       {pots.length > 0 && (
         <ul className="space-y-3">
           {pots.map((p) => {
-            const pct = p.target > 0 ? Math.min(100, ((p.saved || 0) / p.target) * 100) : 0;
+            const isTax = p.kind === "tax";
+            const saved = p.saved || 0;
+            const goal = isTax ? Math.round((drawnTaxYear || 0) * (p.rate || 0) / 100) : (p.target || 0);
+            const pct = goal > 0 ? Math.min(100, (saved / goal) * 100) : 0;
+            let hint = null;
+            if (isTax) {
+              const gap = goal - saved;
+              hint = `${p.rate || 0}% of the ${gbp0(drawnTaxYear || 0)} drawn this tax year${gap > 0 ? ` · ${gbp0(gap)} still to set aside` : " · covered ✓"}`;
+            } else if (p.target > 0 && p.targetDate) {
+              const now = new Date(); now.setHours(0, 0, 0, 0);
+              const t = new Date(p.targetDate + "T00:00:00");
+              const months = Math.max(1, (t.getFullYear() - now.getFullYear()) * 12 + (t.getMonth() - now.getMonth()));
+              const remaining = p.target - saved;
+              const by = t.toLocaleDateString("en-GB", { month: "short", year: "numeric" });
+              hint = remaining <= 0 ? `Fully saved ✓ — ready for ${by}` : `${gbp0(Math.ceil(remaining / months))}/mo to reach it by ${by}`;
+            }
             return (
               <li key={p.id}>
                 <div className="flex items-center justify-between gap-2">
@@ -1125,18 +1157,19 @@ function PotsCard({ pots, earmarked, onCreate, onDelete, onMove }) {
                   </span>
                   <div className="flex items-center gap-2">
                     <span className="text-sm tabular-nums text-slate-500">
-                      {gbp0(p.saved || 0)}{p.target > 0 ? ` / ${gbp0(p.target)}` : ""}
+                      {gbp0(saved)}{goal > 0 ? ` / ${gbp0(goal)}` : ""}
                     </span>
                     <button onClick={() => onDelete(p.id)} className="text-slate-300 hover:text-rose-500">
                       <Trash2 size={15} />
                     </button>
                   </div>
                 </div>
-                {p.target > 0 && (
+                {goal > 0 && (
                   <div className="mt-1.5 h-2 w-full overflow-hidden rounded-full bg-stone-100">
                     <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, backgroundColor: p.color }} />
                   </div>
                 )}
+                {hint && <p className="mt-1 text-xs text-slate-400">{hint}</p>}
               </li>
             );
           })}
@@ -1166,13 +1199,38 @@ function PotsCard({ pots, earmarked, onCreate, onDelete, onMove }) {
 
       {createOpen ? (
         <div className="mt-3 space-y-3 rounded-2xl bg-stone-50 p-3">
-          <Field label="Pot name">
-            <input className={inputCls} placeholder="e.g. Christmas" value={name} onChange={(e) => setName(e.target.value)} />
+          <div className="flex gap-2">
+            <button onClick={() => setKind("goal")}
+              className={`flex-1 rounded-lg px-3 py-1.5 text-sm font-medium transition ${kind === "goal" ? "bg-teal-600 text-white" : "bg-white text-slate-600"}`}>
+              Savings goal
+            </button>
+            <button onClick={() => setKind("tax")}
+              className={`flex-1 rounded-lg px-3 py-1.5 text-sm font-medium transition ${kind === "tax" ? "bg-teal-600 text-white" : "bg-white text-slate-600"}`}>
+              Tax pot
+            </button>
+          </div>
+          <Field label="Name">
+            <input className={inputCls} placeholder={kind === "tax" ? "e.g. Tax" : "e.g. Christmas"} value={name} onChange={(e) => setName(e.target.value)} />
           </Field>
-          <Field label="Target (£) — optional">
-            <input className={inputCls} type="number" inputMode="decimal" placeholder="0.00"
-              value={target} onChange={(e) => setTarget(e.target.value)} />
-          </Field>
+          {kind === "tax" ? (
+            <>
+              <Field label="Set aside this % of what you draw">
+                <input className={inputCls} type="number" inputMode="decimal" placeholder="20"
+                  value={rate} onChange={(e) => setRate(e.target.value)} />
+              </Field>
+              <p className="text-xs text-slate-400">A rough guide based on your drawings this tax year, not a tax calculation.</p>
+            </>
+          ) : (
+            <>
+              <Field label="Target (£) — optional">
+                <input className={inputCls} type="number" inputMode="decimal" placeholder="0.00"
+                  value={target} onChange={(e) => setTarget(e.target.value)} />
+              </Field>
+              <Field label="Need it by — optional">
+                <input className={inputCls} type="date" value={targetDate} onChange={(e) => setTargetDate(e.target.value)} />
+              </Field>
+            </>
+          )}
           <div>
             <span className="mb-1.5 block text-xs font-medium text-slate-500">Colour</span>
             <div className="flex flex-wrap gap-2">
