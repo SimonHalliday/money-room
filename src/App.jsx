@@ -580,7 +580,16 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
   const delPot = (id) => patch((d) => { d.pots = (d.pots || []).filter((p) => p.id !== id); return d; });
   const movePot = (id, delta) => patch((d) => {
     const p = (d.pots || []).find((x) => x.id === id);
-    if (p) p.saved = Math.max(0, (p.saved || 0) + delta);
+    if (!p) return d;
+    // never take out more than is in the pot
+    const applied = delta < 0 ? -Math.min(-delta, p.saved || 0) : delta;
+    const held = (d.accounts || []).find((a) => a.id === p.accountId);
+    const from = (d.accounts || []).find((a) => a.id === p.fromAccountId);
+    if (held && from && held.id !== from.id) {
+      held.balance = (Number.isFinite(held.balance) ? held.balance : 0) + applied;
+      from.balance = (Number.isFinite(from.balance) ? from.balance : 0) - applied;
+    }
+    p.saved = Math.max(0, (p.saved || 0) + applied);
     return d;
   });
 
@@ -652,6 +661,7 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
                 shortfall={shortfall}
                 nudges={nudges}
                 pots={data.pots || []}
+                accounts={data.accounts || []}
                 onAddPot={addPot}
                 onDeletePot={delPot}
                 onMovePot={movePot}
@@ -757,7 +767,7 @@ function FirstRun({ onSetup, onExample }) {
 
 function Home({
   safeToSpend, balancesTotal, remainingThisMonth, earmarked, hasBalances,
-  reserve, projection, projected, shortfall, nudges, pots, onAddPot, onDeletePot, onMovePot,
+  reserve, projection, projected, shortfall, nudges, pots, accounts, onAddPot, onDeletePot, onMovePot,
   drawnThisMonth, drawnTaxYear, drawsByType, committedMonthly, billsTotal, loansMonthly,
   upcoming, perAccount, acctById, onGoSetup, onGoIncome, businessOn,
 }) {
@@ -940,7 +950,7 @@ function Home({
       {hasBalances && <AffordCheck safeToSpend={safeToSpend} reserve={reserve} />}
 
       {hasBalances && (
-        <PotsCard pots={pots} earmarked={earmarked} drawnTaxYear={drawnTaxYear}
+        <PotsCard pots={pots} earmarked={earmarked} drawnTaxYear={drawnTaxYear} accounts={accounts}
           onCreate={onAddPot} onDelete={onDeletePot} onMove={onMovePot} />
       )}
 
@@ -1089,7 +1099,7 @@ function AffordCheck({ safeToSpend, reserve }) {
 /*  SINKING FUNDS / POTS                                               */
 /* ------------------------------------------------------------------ */
 
-function PotsCard({ pots, earmarked, drawnTaxYear, onCreate, onDelete, onMove }) {
+function PotsCard({ pots, earmarked, drawnTaxYear, accounts = [], onCreate, onDelete, onMove }) {
   const [createOpen, setCreateOpen] = useState(false);
   const [kind, setKind] = useState("goal");
   const [name, setName] = useState("");
@@ -1097,17 +1107,20 @@ function PotsCard({ pots, earmarked, drawnTaxYear, onCreate, onDelete, onMove })
   const [targetDate, setTargetDate] = useState("");
   const [rate, setRate] = useState("");
   const [color, setColor] = useState(ACCOUNT_COLORS[2]);
+  const [fromAccountId, setFromAccountId] = useState(accounts[0]?.id || "");
+  const [accountId, setAccountId] = useState(accounts[1]?.id || accounts[0]?.id || "");
   const [moveId, setMoveId] = useState(pots[0]?.id || "");
   const [moveAmt, setMoveAmt] = useState("");
 
   const create = () => {
+    const accts = { fromAccountId, accountId };
     if (kind === "tax") {
       const r = parseFloat(rate);
-      onCreate({ id: uid(), name: name.trim() || "Tax", saved: 0, color, kind: "tax", rate: Number.isFinite(r) ? r : 20 });
+      onCreate({ id: uid(), name: name.trim() || "Tax", saved: 0, color, kind: "tax", rate: Number.isFinite(r) ? r : 20, ...accts });
     } else {
       if (!name.trim()) return;
       const t = parseFloat(target);
-      onCreate({ id: uid(), name: name.trim(), saved: 0, color, target: Number.isFinite(t) ? t : 0, targetDate: targetDate || "" });
+      onCreate({ id: uid(), name: name.trim(), saved: 0, color, target: Number.isFinite(t) ? t : 0, targetDate: targetDate || "", ...accts });
     }
     setName(""); setTarget(""); setTargetDate(""); setRate(""); setKind("goal"); setCreateOpen(false);
   };
@@ -1170,6 +1183,11 @@ function PotsCard({ pots, earmarked, drawnTaxYear, onCreate, onDelete, onMove })
                   </div>
                 )}
                 {hint && <p className="mt-1 text-xs text-slate-400">{hint}</p>}
+                {p.accountId && p.fromAccountId && p.accountId !== p.fromAccountId && (
+                  <p className="mt-0.5 text-[11px] text-slate-400">
+                    {accounts.find((a) => a.id === p.fromAccountId)?.name || "account"} → {accounts.find((a) => a.id === p.accountId)?.name || "account"}
+                  </p>
+                )}
               </li>
             );
           })}
@@ -1186,6 +1204,15 @@ function PotsCard({ pots, earmarked, drawnTaxYear, onCreate, onDelete, onMove })
             <input className={inputCls} style={{ maxWidth: 110 }} type="number" inputMode="decimal" placeholder="£"
               value={moveAmt} onChange={(e) => setMoveAmt(e.target.value)} />
           </div>
+          {(() => {
+            const sel = pots.find((p) => p.id === moveId);
+            if (sel && sel.accountId && sel.fromAccountId && sel.accountId !== sel.fromAccountId) {
+              const fromN = accounts.find((a) => a.id === sel.fromAccountId)?.name || "account";
+              const heldN = accounts.find((a) => a.id === sel.accountId)?.name || "account";
+              return <p className="text-[11px] text-slate-400">Add: {fromN} → {heldN}. Take out reverses it.</p>;
+            }
+            return null;
+          })()}
           <div className="flex gap-2">
             <button onClick={() => move(1)} className={`${btnPrimary} flex-1`}>
               <Plus size={15} /> Add
@@ -1228,6 +1255,20 @@ function PotsCard({ pots, earmarked, drawnTaxYear, onCreate, onDelete, onMove })
               </Field>
               <Field label="Need it by — optional">
                 <input className={inputCls} type="date" value={targetDate} onChange={(e) => setTargetDate(e.target.value)} />
+              </Field>
+            </>
+          )}
+          {accounts.length > 0 && (
+            <>
+              <Field label="Money comes from">
+                <select className={inputCls} value={fromAccountId} onChange={(e) => setFromAccountId(e.target.value)}>
+                  {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                </select>
+              </Field>
+              <Field label="Held in">
+                <select className={inputCls} value={accountId} onChange={(e) => setAccountId(e.target.value)}>
+                  {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                </select>
               </Field>
             </>
           )}
