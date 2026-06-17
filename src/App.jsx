@@ -3,7 +3,7 @@ import { supabase } from "./supabaseClient";
 import {
   Wallet, CalendarClock, ShoppingBag, Landmark, Settings2,
   Plus, Trash2, Check, ArrowDownCircle, X, Sparkles, Banknote, Pencil,
-  Briefcase, AlertTriangle, CreditCard, Upload, ChevronUp, ChevronDown,
+  Briefcase, AlertTriangle, CreditCard, Upload, ChevronUp, ChevronDown, Eye, EyeOff,
 } from "lucide-react";
 import {
   PieChart, Pie, Cell, ResponsiveContainer, Tooltip,
@@ -426,7 +426,12 @@ function CheckToggle({ checked, onChange, label }) {
 /* ------------------------------------------------------------------ */
 
 function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
-  const [tab, setTab] = useState("home");
+  const [tab, setTab] = useState(() => {
+    try { return localStorage.getItem("mr_tab") || "home"; } catch { return "home"; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("mr_tab", tab); } catch {}
+  }, [tab]);
   const businessOn = data.businessEnabled !== false;
 
   const acctById = useMemo(() => {
@@ -2999,6 +3004,7 @@ function Auth() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);
+  const [showPw, setShowPw] = useState(false);
 
   const submit = async () => {
     const mail = email.trim();
@@ -3012,9 +3018,8 @@ function Auth() {
         // With "Confirm email" off, a session comes back and the auth listener
         // takes over. If confirmation is still on, there's no session yet.
         if (!data.session) {
-          setNotice("Account created — you can sign in now.");
+          setNotice("Account created. If sign-in says the details are wrong, 'Confirm email' is still switched on in Supabase — turn it off, then sign in.");
           setMode("signin");
-          setPassword("");
         }
       } else {
         const { error } = await supabase.auth.signInWithPassword({ email: mail, password });
@@ -3022,8 +3027,9 @@ function Auth() {
       }
     } catch (e) {
       const msg = e?.message || "";
-      if (/already registered/i.test(msg)) setError("That email's already set up — switch to Sign in below.");
-      else if (/invalid login credentials/i.test(msg)) setError("Email or password isn't right. Try again.");
+      if (/already registered/i.test(msg)) setError("That email's already set up — switch to Sign in below and use that password.");
+      else if (/email not confirmed/i.test(msg)) setError("This account hasn't been confirmed. Turn off 'Confirm email' in Supabase, or use the confirmation link in your inbox.");
+      else if (/invalid login credentials/i.test(msg)) setError("Email or password isn't right. Tap the eye to check what you typed. If you'd used this email here before, the old account may need deleting in Supabase first.");
       else setError(msg || "Something went wrong. Try again.");
     } finally {
       setBusy(false);
@@ -3052,10 +3058,17 @@ function Auth() {
                 value={email} onChange={(e) => setEmail(e.target.value)} onKeyDown={onKey} />
             </Field>
             <Field label="Password">
-              <input className={inputCls} type="password"
-                autoComplete={mode === "signup" ? "new-password" : "current-password"}
-                placeholder={mode === "signup" ? "At least 6 characters" : "Your password"}
-                value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={onKey} />
+              <div className="relative">
+                <input className={`${inputCls} pr-11`} type={showPw ? "text" : "password"}
+                  autoComplete={mode === "signup" ? "new-password" : "current-password"}
+                  placeholder={mode === "signup" ? "At least 6 characters" : "Your password"}
+                  value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={onKey} />
+                <button type="button" onClick={() => setShowPw((s) => !s)}
+                  aria-label={showPw ? "Hide password" : "Show password"}
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded-md p-1.5 text-slate-400 transition hover:text-slate-600">
+                  {showPw ? <EyeOff size={18} /> : <Eye size={18} />}
+                </button>
+              </div>
             </Field>
             {error && <p className="text-sm text-rose-600">{error}</p>}
             {notice && <p className="text-sm text-teal-600">{notice}</p>}
