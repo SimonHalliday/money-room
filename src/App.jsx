@@ -1310,13 +1310,15 @@ function StatementAnalyser({ data, patch }) {
         const page = await pdf.getPage(i);
         const tc = await page.getTextContent();
         out += tc.items.map((it) => it.str).join(" ") + "\n";
-        if (out.length > 120000) break;
+        if (out.length > 40000) break;
       }
       if (out.trim().length > 40) {
         setText(out); setPdfBase64("");
       } else {
-        // No text layer (a scanned image) — fall back to sending the file itself.
-        setPdfBase64(await fileToBase64(f)); setText("");
+        // No text layer (e.g. a scan) — sending the whole file just times out,
+        // so point at the routes that do work instead.
+        setError("This PDF has no readable text in it (it may be a scan). Your bank's CSV export, or pasting the transactions in, will work.");
+        setFileName("");
       }
     } catch (err) {
       setError("Couldn't read that PDF. If it's a scanned image, a CSV export or pasting the text will work.");
