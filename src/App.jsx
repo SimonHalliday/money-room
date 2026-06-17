@@ -8,6 +8,13 @@ import {
 import {
   PieChart, Pie, Cell, ResponsiveContainer, Tooltip,
 } from "recharts";
+import * as pdfjsLib from "pdfjs-dist";
+
+// PDF text is extracted in the browser, then sent as plain text (the path that
+// works) instead of a heavy raw-PDF upload. The worker is pulled from a CDN at
+// the exact installed version, so it can never version-mismatch the library.
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
@@ -62,6 +69,7 @@ const EMPTY = {
   pots: [],
   reserve: 0,
   business: { accounts: [], loans: [] },
+  businessEnabled: true,
 };
 
 /* ------------------------------------------------------------------ */
@@ -342,6 +350,7 @@ function CheckToggle({ checked, onChange, label }) {
 
 function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
   const [tab, setTab] = useState("home");
+  const businessOn = data.businessEnabled !== false;
 
   const acctById = useMemo(() => {
     const m = {};
@@ -482,9 +491,10 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
                 acctById={acctById}
                 onGoSetup={() => setTab("setup")}
                 onGoIncome={() => setTab("income")}
+                businessOn={businessOn}
               />
             )}
-            {tab === "income" && (
+            {tab === "income" && businessOn && (
               <Income
                 data={data}
                 acctById={acctById}
@@ -522,7 +532,7 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
             { id: "spend", label: "Spend", icon: ShoppingBag },
             { id: "loans", label: "Debt", icon: Landmark },
             { id: "setup", label: "More", icon: Settings2 },
-          ].map((t) => {
+          ].filter((t) => businessOn || t.id !== "income").map((t) => {
             const Active = tab === t.id;
             const Icon = t.icon;
             return (
@@ -580,7 +590,7 @@ function Home({
   safeToSpend, balancesTotal, remainingThisMonth, earmarked, hasBalances,
   reserve, projected, shortfall, nudges, pots, onAddPot, onDeletePot, onMovePot,
   drawnThisMonth, drawsByType, committedMonthly, billsTotal, loansMonthly,
-  upcoming, perAccount, acctById, onGoSetup, onGoIncome,
+  upcoming, perAccount, acctById, onGoSetup, onGoIncome, businessOn,
 }) {
   const monthName = new Date().toLocaleDateString("en-GB", { month: "long" });
   const positive = safeToSpend >= 0;
@@ -656,7 +666,7 @@ function Home({
       )}
 
       {/* Do you need to draw more? */}
-      {hasBalances && (
+      {businessOn && hasBalances && (
         <div
           className={`rounded-3xl border p-5 shadow-sm ${
             needDraw ? "border-amber-200 bg-amber-50" : "border-teal-200 bg-teal-50"
@@ -713,6 +723,7 @@ function Home({
       )}
 
       {/* This month's draws */}
+      {businessOn && (
       <Card>
         <div className="flex items-start justify-between">
           <div>
@@ -742,6 +753,7 @@ function Home({
           bills &amp; loans ({gbp0(billsTotal)} + {gbp0(loansMonthly)}).
         </div>
       </Card>
+      )}
 
       {/* Coming out soon */}
       <Card>
@@ -1259,6 +1271,15 @@ function Bills({ data, acctById, billsTotal, patch }) {
 /*  STATEMENT ANALYSER (Claude API)                                   */
 /* ------------------------------------------------------------------ */
 
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(",")[1] || "");
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+}
+
 function StatementAnalyser({ data, patch }) {
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
@@ -1268,23 +1289,44 @@ function StatementAnalyser({ data, patch }) {
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
   const [imported, setImported] = useState(false);
+  const [extracting, setExtracting] = useState(false);
 
-  const onFile = (e) => {
+  const onFile = async (e) => {
     const f = e.target.files && e.target.files[0];
     if (!f) return;
     setFileName(f.name); setError(null); setResult(null); setImported(false);
-    const reader = new FileReader();
     const isPdf = f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
-    if (isPdf) {
-      reader.onload = () => { setPdfBase64(String(reader.result).split(",")[1] || ""); setText(""); };
-      reader.readAsDataURL(f);
-    } else {
-      reader.onload = () => { setText(String(reader.result || "")); setPdfBase64(""); };
-      reader.readAsText(f);
+    if (!isPdf) {
+      setText(await f.text()); setPdfBase64("");
+      return;
+    }
+    // PDF: pull the text out here, then send it as text (the path that works).
+    setExtracting(true);
+    try {
+      const buf = await f.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
+      let out = "";
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const tc = await page.getTextContent();
+        out += tc.items.map((it) => it.str).join(" ") + "\n";
+        if (out.length > 120000) break;
+      }
+      if (out.trim().length > 40) {
+        setText(out); setPdfBase64("");
+      } else {
+        // No text layer (a scanned image) — fall back to sending the file itself.
+        setPdfBase64(await fileToBase64(f)); setText("");
+      }
+    } catch (err) {
+      setError("Couldn't read that PDF. If it's a scanned image, a CSV export or pasting the text will work.");
+      setFileName("");
+    } finally {
+      setExtracting(false);
     }
   };
 
-  const canAnalyse = (text.trim().length > 0 || pdfBase64.length > 0) && !loading;
+  const canAnalyse = (text.trim().length > 0 || pdfBase64.length > 0) && !loading && !extracting;
 
   const analyse = async () => {
     setLoading(true); setError(null); setResult(null); setImported(false);
@@ -1349,7 +1391,7 @@ function StatementAnalyser({ data, patch }) {
         <div className="mt-4 space-y-3">
           <label className="flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-2xl border-2 border-dashed border-stone-300 px-4 py-6 text-center transition hover:border-indigo-400 hover:bg-indigo-50">
             <Upload size={20} className="text-slate-400" />
-            <span className="text-sm font-medium text-slate-600">{fileName || "Upload a CSV or PDF"}</span>
+            <span className="text-sm font-medium text-slate-600">{extracting ? "Reading the PDF…" : (fileName || "Upload a CSV or PDF")}</span>
             <span className="text-xs text-slate-400">tap to choose a file</span>
             <input type="file" accept=".csv,.txt,.pdf" onChange={onFile} className="hidden" />
           </label>
@@ -1812,6 +1854,7 @@ function LoanList({ loans, accounts, onAdd, onDelete, onLogPayment, onDeletePaym
 
 function LoansTab({ data, drawnThisMonth, patch }) {
   const [seg, setSeg] = useState("personal");
+  const businessOn = data.businessEnabled !== false;
 
   /* personal loan handlers */
   const pAdd = (loan) => patch((d) => { d.loans.push(loan); return d; });
@@ -1934,6 +1977,7 @@ function LoansTab({ data, drawnThisMonth, patch }) {
         >
           <Wallet size={15} /> Personal
         </button>
+        {businessOn && (
         <button
           onClick={() => setSeg("business")}
           className={`flex flex-1 items-center justify-center gap-1.5 rounded-xl py-2 text-sm font-semibold transition ${
@@ -1942,6 +1986,7 @@ function LoansTab({ data, drawnThisMonth, patch }) {
         >
           <Briefcase size={15} /> Business
         </button>
+        )}
         <button
           onClick={() => setSeg("cards")}
           className={`flex flex-1 items-center justify-center gap-1.5 rounded-xl py-2 text-sm font-semibold transition ${
@@ -1967,7 +2012,7 @@ function LoansTab({ data, drawnThisMonth, patch }) {
             emptyText="No personal debts tracked yet. Add one to watch the balance shrink every time you log a payment."
           />
         </>
-      ) : seg === "business" ? (
+      ) : seg === "business" && businessOn ? (
         <>
           {/* business overview */}
           <div className="grid grid-cols-2 gap-3">
@@ -2355,6 +2400,7 @@ function Setup({ data, patch, onReset, onExample, householdCode, onSignOut }) {
   const [reserveStr, setReserveStr] = useState(String(data.reserve || ""));
   const [confirmExample, setConfirmExample] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
+  const businessOn = data.businessEnabled !== false;
 
   const addAccount = () => {
     if (!accName.trim()) return;
@@ -2385,21 +2431,42 @@ function Setup({ data, patch, onReset, onExample, householdCode, onSignOut }) {
 
   return (
     <div className="space-y-4">
-      {/* household + account */}
+      {/* account */}
       <Card>
-        <Eyebrow>Your household</Eyebrow>
+        <Eyebrow>Your account</Eyebrow>
         <p className="mb-3 mt-1 text-sm text-slate-500">
-          Everyone who joins with this code shares the same data, synced live across phones.
-          Give it to Kate (or whoever) so you're both looking at the same picture.
+          Your data is private to you and synced across your own devices when you sign in.
         </p>
-        {householdCode && (
-          <div className="flex items-center justify-between rounded-2xl bg-stone-50 px-4 py-3">
-            <span className="text-xs font-medium uppercase tracking-widest text-slate-400">Join code</span>
-            <span className="text-xl font-bold tracking-widest text-slate-900">{householdCode}</span>
-          </div>
-        )}
         <button onClick={onSignOut} className={`${btnGhost} mt-3 w-full`}>
           Sign out
+        </button>
+      </Card>
+
+      {/* business features toggle */}
+      <Card>
+        <Eyebrow>Business features</Eyebrow>
+        <p className="mb-3 mt-1 text-sm text-slate-500">
+          Switch this off if you only track personal money. It hides the Income (draws) tab,
+          the business side of Debt, and the draw prompts on the home screen. Nothing is deleted —
+          flip it back on any time and your business data returns.
+        </p>
+        <button
+          onClick={() => patch((d) => { d.businessEnabled = !businessOn; return d; })}
+          className={`flex w-full items-center justify-between rounded-2xl border px-4 py-3 transition ${
+            businessOn ? "border-teal-200 bg-teal-50" : "border-stone-200 bg-stone-50"
+          }`}
+        >
+          <span className="flex items-center gap-2 text-sm font-medium text-slate-700">
+            <Briefcase size={16} className={businessOn ? "text-teal-600" : "text-slate-400"} />
+            Business features {businessOn ? "on" : "off"}
+          </span>
+          <span className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition ${
+            businessOn ? "bg-teal-600" : "bg-stone-300"
+          }`}>
+            <span className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition ${
+              businessOn ? "translate-x-5" : "translate-x-0.5"
+            }`} />
+          </span>
         </button>
       </Card>
 
@@ -2408,7 +2475,9 @@ function Setup({ data, patch, onReset, onExample, householdCode, onSignOut }) {
         <Eyebrow>Your safety net</Eyebrow>
         <p className="mb-3 mt-1 text-sm text-slate-500">
           The cushion you want to keep in your personal accounts for day-to-day spending
-          and surprises. The home screen uses this to tell you whether you need to draw more.
+          and surprises.{businessOn
+            ? " The home screen uses this to tell you whether you need to draw more."
+            : " The affordability check uses it to warn you before a purchase dips into it."}
         </p>
         <div className="flex gap-2">
           <input className={inputCls} type="number" inputMode="decimal" placeholder="e.g. 800"
@@ -2598,6 +2667,7 @@ function normalizeData(parsed) {
   if (!Array.isArray(merged.cards)) merged.cards = [];
   if (!Array.isArray(merged.pots)) merged.pots = [];
   if (!Number.isFinite(merged.reserve)) merged.reserve = 0;
+  if (typeof merged.businessEnabled !== "boolean") merged.businessEnabled = true;
   return merged;
 }
 
@@ -2610,21 +2680,44 @@ function Splash({ label }) {
 }
 
 function Auth() {
+  const [mode, setMode] = useState("signin"); // "signin" | "signup"
   const [email, setEmail] = useState("");
-  const [sent, setSent] = useState(false);
+  const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const [notice, setNotice] = useState(null);
 
-  const send = async () => {
-    if (!email.trim()) return;
-    setBusy(true); setError(null);
-    const { error } = await supabase.auth.signInWithOtp({
-      email: email.trim(),
-      options: { emailRedirectTo: window.location.origin },
-    });
-    setBusy(false);
-    if (error) setError(error.message); else setSent(true);
+  const submit = async () => {
+    const mail = email.trim();
+    if (!mail || !password) { setError("Enter your email and password."); return; }
+    if (password.length < 6) { setError("Password needs to be at least 6 characters."); return; }
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      if (mode === "signup") {
+        const { data, error } = await supabase.auth.signUp({ email: mail, password });
+        if (error) throw error;
+        // With "Confirm email" off, a session comes back and the auth listener
+        // takes over. If confirmation is still on, there's no session yet.
+        if (!data.session) {
+          setNotice("Account created — you can sign in now.");
+          setMode("signin");
+          setPassword("");
+        }
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({ email: mail, password });
+        if (error) throw error;
+      }
+    } catch (e) {
+      const msg = e?.message || "";
+      if (/already registered/i.test(msg)) setError("That email's already set up — switch to Sign in below.");
+      else if (/invalid login credentials/i.test(msg)) setError("Email or password isn't right. Try again.");
+      else setError(msg || "Something went wrong. Try again.");
+    } finally {
+      setBusy(false);
+    }
   };
+
+  const onKey = (e) => { if (e.key === "Enter") submit(); };
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-stone-50 px-4">
@@ -2634,29 +2727,37 @@ function Auth() {
             <Wallet size={26} />
           </div>
           <h1 className="text-2xl font-bold tracking-tight text-slate-900">The Money Room</h1>
-          <p className="mt-1 text-sm text-slate-500">Sign in with your email — no password to forget.</p>
+          <p className="mt-1 text-sm text-slate-500">
+            {mode === "signup" ? "Create your account to get started." : "Welcome back — sign in to continue."}
+          </p>
         </div>
         <div className="rounded-3xl border border-stone-200 bg-white p-5 shadow-sm">
-          {sent ? (
-            <div className="text-center">
-              <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-teal-50 text-teal-600">
-                <Check size={24} strokeWidth={3} />
-              </div>
-              <p className="text-sm font-medium text-slate-800">Check your email</p>
-              <p className="mt-1 text-sm text-slate-500">We've sent a magic link to {email}. Tap it to sign in.</p>
-            </div>
-          ) : (
-            <div className="space-y-3">
-              <Field label="Email">
-                <input className={inputCls} type="email" inputMode="email" placeholder="you@email.com"
-                  value={email} onChange={(e) => setEmail(e.target.value)} />
-              </Field>
-              {error && <p className="text-sm text-rose-600">{error}</p>}
-              <button onClick={send} disabled={busy} className={`${btnPrimary} w-full`}>
-                {busy ? "Sending…" : "Send me a magic link"}
-              </button>
-            </div>
-          )}
+          <div className="space-y-3">
+            <Field label="Email">
+              <input className={inputCls} type="email" inputMode="email" autoComplete="email"
+                placeholder="you@email.com"
+                value={email} onChange={(e) => setEmail(e.target.value)} onKeyDown={onKey} />
+            </Field>
+            <Field label="Password">
+              <input className={inputCls} type="password"
+                autoComplete={mode === "signup" ? "new-password" : "current-password"}
+                placeholder={mode === "signup" ? "At least 6 characters" : "Your password"}
+                value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={onKey} />
+            </Field>
+            {error && <p className="text-sm text-rose-600">{error}</p>}
+            {notice && <p className="text-sm text-teal-600">{notice}</p>}
+            <button onClick={submit} disabled={busy} className={`${btnPrimary} w-full`}>
+              {busy ? "Just a sec…" : mode === "signup" ? "Create account" : "Sign in"}
+            </button>
+          </div>
+          <div className="mt-4 text-center text-sm text-slate-500">
+            {mode === "signup" ? "Already have an account?" : "First time here?"}{" "}
+            <button type="button"
+              onClick={() => { setMode(mode === "signup" ? "signin" : "signup"); setError(null); setNotice(null); }}
+              className="font-medium text-teal-600 hover:text-teal-700">
+              {mode === "signup" ? "Sign in" : "Create an account"}
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -2664,57 +2765,33 @@ function Auth() {
 }
 
 function Onboarding() {
-  const [mode, setMode] = useState("choose");
-  const [code, setCode] = useState("");
-  const [busy, setBusy] = useState(false);
+  const startedRef = useRef(false);
   const [error, setError] = useState(null);
 
-  const create = async () => {
-    setBusy(true); setError(null);
-    const { error } = await supabase.rpc("create_household");
-    if (error) { setError(error.message); setBusy(false); } else { window.location.reload(); }
-  };
-  const join = async () => {
-    if (!code.trim()) return;
-    setBusy(true); setError(null);
-    const { error } = await supabase.rpc("join_household", { code: code.trim() });
-    if (error) { setError(error.message); setBusy(false); } else { window.location.reload(); }
-  };
+  useEffect(() => {
+    if (startedRef.current) return;
+    startedRef.current = true;
+    (async () => {
+      const { error } = await supabase.rpc("create_household");
+      if (error) setError(error.message);
+      else window.location.reload();
+    })();
+  }, []);
 
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-stone-50 px-4">
-      <div className="w-full max-w-sm rounded-3xl border border-stone-200 bg-white p-5 shadow-sm">
-        <h2 className="text-lg font-bold text-slate-900">One quick thing</h2>
-        <p className="mt-1 text-sm text-slate-500">
-          Start a new household, or join one someone's already set up with their code.
-        </p>
-        {error && <p className="mt-3 text-sm text-rose-600">{error}</p>}
-        {mode === "choose" ? (
-          <div className="mt-4 flex flex-col gap-2">
-            <button onClick={create} disabled={busy} className={`${btnPrimary} w-full`}>
-              {busy ? "Setting up…" : "Start a new household"}
-            </button>
-            <button onClick={() => setMode("join")} className={`${btnGhost} w-full`}>
-              Join with a code
-            </button>
-          </div>
-        ) : (
-          <div className="mt-4 space-y-3">
-            <Field label="Household code">
-              <input className={inputCls} placeholder="6-character code"
-                value={code} onChange={(e) => setCode(e.target.value)} />
-            </Field>
-            <button onClick={join} disabled={busy} className={`${btnPrimary} w-full`}>
-              {busy ? "Joining…" : "Join household"}
-            </button>
-            <button onClick={() => setMode("choose")} className={`${btnGhost} w-full`}>
-              Back
-            </button>
-          </div>
-        )}
+  if (error) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-stone-50 px-4">
+        <div className="w-full max-w-sm rounded-3xl border border-stone-200 bg-white p-5 text-center shadow-sm">
+          <p className="text-sm font-medium text-slate-800">Couldn't finish setting up</p>
+          <p className="mt-1 text-sm text-rose-600">{error}</p>
+          <button onClick={() => window.location.reload()} className={`${btnPrimary} mt-4 w-full`}>
+            Try again
+          </button>
+        </div>
       </div>
-    </div>
-  );
+    );
+  }
+  return <Splash label="Setting up your account…" />;
 }
 
 function useHousehold(session) {
