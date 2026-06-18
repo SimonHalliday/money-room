@@ -97,6 +97,11 @@ function localISO(d = new Date()) {
   return new Date(d.getTime() - off * 60000).toISOString().slice(0, 10);
 }
 
+// "YYYY-MM" for the given date, used to mark a bill paid for a specific month.
+function monthKey(d = new Date()) {
+  return localISO(d).slice(0, 7);
+}
+
 function nextDue(day) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -121,6 +126,7 @@ function daysUntil(date) {
 // Returns the daily points plus the lowest point and the date it happens.
 function buildProjection(startBalance, bills, days = 42) {
   const today = new Date(); today.setHours(0, 0, 0, 0);
+  const thisMK = monthKey(today);
   const lastOf = (yy, mm) => new Date(yy, mm + 1, 0).getDate();
   const end = new Date(today); end.setDate(today.getDate() + days);
   const dropByOffset = {};
@@ -129,6 +135,7 @@ function buildProjection(startBalance, bills, days = 42) {
     const dom = Number(b.day) || 0;
     if (!amt || !dom) return;
     for (let k = 0; k <= 2; k++) {
+      if (k === 0 && b.paidMonth === thisMK) continue; // already paid this month — don't subtract again
       const yy = today.getFullYear();
       const mm = today.getMonth() + k;
       const due = new Date(yy, mm, Math.min(dom, lastOf(yy, mm)));
@@ -175,6 +182,28 @@ function dateInThisMonth(date) {
 
 const dueLabel = (n) => (n === 0 ? "Today" : n === 1 ? "Tomorrow" : `in ${n} days`);
 const balanceOf = (a) => (Number.isFinite(a.balance) ? a.balance : 0);
+
+// Per-category spend for this month vs last month, from logged transactions.
+function categoryTrends(transactions) {
+  const now = new Date();
+  const thisY = now.getFullYear(), thisM = now.getMonth();
+  const lastM = thisM === 0 ? 11 : thisM - 1;
+  const lastY = thisM === 0 ? thisY - 1 : thisY;
+  const inMonth = (iso, y, m) => {
+    if (!iso) return false;
+    const d = new Date(iso + "T00:00:00");
+    return d.getFullYear() === y && d.getMonth() === m;
+  };
+  const a = {}, b = {};
+  (transactions || []).forEach((t) => {
+    if (inMonth(t.date, thisY, thisM)) a[t.category] = (a[t.category] || 0) + (t.amount || 0);
+    else if (inMonth(t.date, lastY, lastM)) b[t.category] = (b[t.category] || 0) + (t.amount || 0);
+  });
+  return Array.from(new Set([...Object.keys(a), ...Object.keys(b)]))
+    .map((c) => ({ category: c, now: a[c] || 0, prev: b[c] || 0 }))
+    .filter((x) => x.now > 0 || x.prev > 0)
+    .sort((x, y2) => y2.now - x.now);
+}
 const owedOn = (l) =>
   Math.max(0, (l.original || 0) - l.payments.reduce((s, p) => s + (p.amount || 0), 0));
 
@@ -416,8 +445,8 @@ function EditModal({ title, fields, item, onSave, onClose }) {
               ) : (
                 <input
                   className={inputCls}
-                  type={f.type === "text" ? "text" : "number"}
-                  inputMode={f.type === "text" ? undefined : "decimal"}
+                  type={f.type === "text" ? "text" : f.type === "date" ? "date" : "number"}
+                  inputMode={f.type === "text" || f.type === "date" ? undefined : "decimal"}
                   step={f.type === "money" || f.type === "percent" ? "0.01" : f.type === "number" ? "1" : undefined}
                   value={draft[f.key]}
                   onChange={(e) => set(f.key, e.target.value)}
@@ -476,6 +505,91 @@ const NAV = [
   { id: "setup", label: "More", icon: Settings2 },
 ];
 
+// A floating button + minimal sheet for logging a spend from anywhere in two taps.
+function QuickAdd({ data, patch }) {
+  const accounts = data.accounts || [];
+  const cards = data.cards || [];
+  const cats = data.categories?.length ? data.categories : CATEGORIES;
+  const [open, setOpen] = useState(false);
+  const [amount, setAmount] = useState("");
+  const [category, setCategory] = useState(cats[0]);
+  const [srcVal, setSrcVal] = useState(accounts[0] ? `a:${accounts[0].id}` : cards[0] ? `c:${cards[0].id}` : "");
+
+  if (accounts.length === 0 && cards.length === 0) return null;
+
+  const sources = [
+    ...accounts.map((a) => ({ value: `a:${a.id}`, label: a.name })),
+    ...cards.map((c) => ({ value: `c:${c.id}`, label: `${c.name} (card)` })),
+  ];
+
+  const save = () => {
+    const amt = parseFloat(amount);
+    if (!Number.isFinite(amt) || amt <= 0 || !srcVal) return;
+    const isCard = srcVal.startsWith("c:");
+    const accId = srcVal.slice(2);
+    patch((d) => {
+      d.transactions = d.transactions || [];
+      d.transactions.push({ id: uid(), amount: amt, category, accountId: accId, isCard, date: localISO(), note: "", applied: true });
+      if (isCard) { const c = (d.cards || []).find((x) => x.id === accId); if (c) c.balance = (c.balance || 0) + amt; }
+      else { const a = (d.accounts || []).find((x) => x.id === accId); if (a) a.balance = balanceOf(a) - amt; }
+      return d;
+    });
+    setAmount(""); setCategory(cats[0]); setOpen(false);
+  };
+
+  return (
+    <>
+      <button
+        onClick={() => setOpen(true)}
+        aria-label="Quick add spend"
+        className="fixed bottom-24 right-5 z-30 flex h-14 w-14 items-center justify-center rounded-full bg-teal-600 text-white shadow-lg shadow-teal-600/30 transition hover:bg-teal-700 active:scale-95 lg:bottom-8 lg:right-8"
+      >
+        <Plus size={26} strokeWidth={2.4} />
+      </button>
+
+      {open && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/40 sm:items-center sm:p-4" onClick={() => setOpen(false)}>
+          <div className="w-full max-w-sm rounded-t-3xl bg-white p-5 shadow-xl sm:rounded-3xl" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-lg font-bold text-slate-900">Quick add spend</h3>
+              <button onClick={() => setOpen(false)} className="rounded-full p-1 text-slate-400 hover:bg-stone-100"><X size={18} /></button>
+            </div>
+            <div className="relative mb-4">
+              <span className="absolute left-4 top-1/2 -translate-y-1/2 text-2xl font-semibold text-slate-400">£</span>
+              <input
+                autoFocus type="number" inputMode="decimal" placeholder="0.00"
+                value={amount} onChange={(e) => setAmount(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") save(); }}
+                className="w-full rounded-2xl border border-stone-200 bg-stone-50 py-3 pl-10 pr-4 text-2xl font-bold tabular-nums text-slate-900 outline-none focus:border-teal-500"
+              />
+            </div>
+            <p className="mb-1.5 text-xs font-medium text-slate-500">Category</p>
+            <div className="mb-4 flex flex-wrap gap-2">
+              {cats.map((c) => (
+                <button key={c} onClick={() => setCategory(c)}
+                  className={`rounded-full px-3 py-1.5 text-sm font-medium transition ${category === c ? "bg-teal-600 text-white" : "bg-stone-100 text-slate-600 hover:bg-stone-200"}`}>
+                  {c}
+                </button>
+              ))}
+            </div>
+            {sources.length > 1 && (
+              <div className="mb-4">
+                <p className="mb-1.5 text-xs font-medium text-slate-500">Paid with</p>
+                <select className={inputCls} value={srcVal} onChange={(e) => setSrcVal(e.target.value)}>
+                  {sources.map((s) => <option key={s.value} value={s.value}>{s.label}</option>)}
+                </select>
+              </div>
+            )}
+            <button onClick={save} className={`${btnPrimary} w-full`}>
+              <Check size={16} /> Add {amount ? gbp(parseFloat(amount) || 0) : "spend"}
+            </button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
   const [tab, setTab] = useState(() => {
     try { return localStorage.getItem("mr_tab") || "home"; } catch { return "home"; }
@@ -503,9 +617,10 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
     () => data.accounts.some((a) => Number.isFinite(a.balance) && a.balance !== 0),
     [data.accounts]
   );
+  const thisMK = monthKey();
   const remainingBills = useMemo(
-    () => data.bills.filter((b) => dateInThisMonth(nextDue(b.day))).reduce((s, b) => s + (b.amount || 0), 0),
-    [data.bills]
+    () => data.bills.filter((b) => dateInThisMonth(nextDue(b.day)) && b.paidMonth !== thisMK).reduce((s, b) => s + (b.amount || 0), 0),
+    [data.bills, thisMK]
   );
   const remainingLoans = useMemo(
     () =>
@@ -574,6 +689,7 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
   const patch = (fn) => setData((d) => fn(structuredClone(d)));
   const resetAll = () => { setData(EMPTY); setTab("home"); };
   const loadExample = () => { setData(makeExample()); setTab("home"); };
+  const restoreData = (obj) => { setData(normalizeData(obj)); setTab("home"); };
 
   const nudges = useMemo(() => buildNudges(data), [data]);
   const addPot = (pot) => patch((d) => { if (!d.pots) d.pots = []; d.pots.push(pot); return d; });
@@ -590,6 +706,12 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
       from.balance = (Number.isFinite(from.balance) ? from.balance : 0) - applied;
     }
     p.saved = Math.max(0, (p.saved || 0) + applied);
+    return d;
+  });
+  const editPot = (id, changes) => patch((d) => {
+    const p = (d.pots || []).find((x) => x.id === id);
+    if (!p) return d;
+    Object.assign(p, changes); // relinks/renames only — never touches saved or moves money
     return d;
   });
 
@@ -665,6 +787,7 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
                 onAddPot={addPot}
                 onDeletePot={delPot}
                 onMovePot={movePot}
+                onEditPot={editPot}
                 drawnThisMonth={drawnThisMonth}
                 drawnTaxYear={drawnTaxYear}
                 drawsByType={drawsByType}
@@ -701,7 +824,7 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
               <LoansTab data={data} drawnThisMonth={drawnThisMonth} patch={patch} />
             )}
             {tab === "setup" && (
-              <Setup data={data} patch={patch} onReset={resetAll} onExample={loadExample}
+              <Setup data={data} patch={patch} onReset={resetAll} onExample={loadExample} onRestore={restoreData}
                 householdCode={householdCode} onSignOut={onSignOut} />
             )}
           </>
@@ -730,6 +853,8 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
           })}
         </div>
       </nav>
+
+      {!firstRun && <QuickAdd data={data} patch={patch} />}
     </div>
   );
 }
@@ -767,7 +892,7 @@ function FirstRun({ onSetup, onExample }) {
 
 function Home({
   safeToSpend, balancesTotal, remainingThisMonth, earmarked, hasBalances,
-  reserve, projection, projected, shortfall, nudges, pots, accounts, onAddPot, onDeletePot, onMovePot,
+  reserve, projection, projected, shortfall, nudges, pots, accounts, onAddPot, onDeletePot, onMovePot, onEditPot,
   drawnThisMonth, drawnTaxYear, drawsByType, committedMonthly, billsTotal, loansMonthly,
   upcoming, perAccount, acctById, onGoSetup, onGoIncome, businessOn,
 }) {
@@ -951,7 +1076,7 @@ function Home({
 
       {hasBalances && (
         <PotsCard pots={pots} earmarked={earmarked} drawnTaxYear={drawnTaxYear} accounts={accounts}
-          onCreate={onAddPot} onDelete={onDeletePot} onMove={onMovePot} />
+          onCreate={onAddPot} onDelete={onDeletePot} onMove={onMovePot} onEdit={onEditPot} />
       )}
 
       {/* This month's draws */}
@@ -1099,8 +1224,9 @@ function AffordCheck({ safeToSpend, reserve }) {
 /*  SINKING FUNDS / POTS                                               */
 /* ------------------------------------------------------------------ */
 
-function PotsCard({ pots, earmarked, drawnTaxYear, accounts = [], onCreate, onDelete, onMove }) {
+function PotsCard({ pots, earmarked, drawnTaxYear, accounts = [], onCreate, onDelete, onMove, onEdit }) {
   const [createOpen, setCreateOpen] = useState(false);
+  const [editingPot, setEditingPot] = useState(null);
   const [kind, setKind] = useState("goal");
   const [name, setName] = useState("");
   const [target, setTarget] = useState("");
@@ -1172,6 +1298,7 @@ function PotsCard({ pots, earmarked, drawnTaxYear, accounts = [], onCreate, onDe
                     <span className="text-sm tabular-nums text-slate-500">
                       {gbp0(saved)}{goal > 0 ? ` / ${gbp0(goal)}` : ""}
                     </span>
+                    {onEdit && <EditBtn onClick={() => setEditingPot(p)} />}
                     <button onClick={() => onDelete(p.id)} className="text-slate-300 hover:text-rose-500">
                       <Trash2 size={15} />
                     </button>
@@ -1290,6 +1417,29 @@ function PotsCard({ pots, earmarked, drawnTaxYear, accounts = [], onCreate, onDe
         <button onClick={() => setCreateOpen(true)} className={`${btnGhost} mt-3 w-full`}>
           <Plus size={15} /> New pot
         </button>
+      )}
+      {editingPot && (
+        <EditModal
+          title={editingPot.kind === "tax" ? "Edit tax pot" : "Edit pot"}
+          item={editingPot}
+          fields={[
+            { key: "name", label: "Name", type: "text" },
+            ...(editingPot.kind === "tax"
+              ? [{ key: "rate", label: "Tax rate (%)", type: "percent" }]
+              : [
+                  { key: "target", label: "Target (£)", type: "money" },
+                  { key: "targetDate", label: "Need it by (optional)", type: "date" },
+                ]),
+            ...(accounts.length > 1
+              ? [
+                  { key: "fromAccountId", label: "Funded from", type: "select", options: accounts.map((a) => ({ value: a.id, label: a.name })) },
+                  { key: "accountId", label: "Held in", type: "select", options: accounts.map((a) => ({ value: a.id, label: a.name })) },
+                ]
+              : []),
+          ]}
+          onSave={(changes) => { onEdit(editingPot.id, changes); setEditingPot(null); }}
+          onClose={() => setEditingPot(null)}
+        />
       )}
     </Card>
   );
@@ -1553,11 +1703,19 @@ function Bills({ data, acctById, billsTotal, patch }) {
   };
 
   const sorted = [...data.bills].sort((a, b) => a.day - b.day);
+  const thisMK = monthKey();
+  const togglePaid = (b) =>
+    patch((d) => {
+      const x = d.bills.find((y) => y.id === b.id);
+      if (x) x.paidMonth = x.paidMonth === thisMK ? "" : thisMK;
+      return d;
+    });
+  const paidCount = sorted.filter((b) => b.paidMonth === thisMK).length;
 
   return (
     <div className="space-y-4 lg:columns-2 lg:gap-5 lg:space-y-0 lg:[&>*]:mb-5 lg:[&>*]:break-inside-avoid">
       <SummaryBar label="Regular bills, every month" value={billsTotal}
-        sub={`${data.bills.length} bill${data.bills.length === 1 ? "" : "s"}`} />
+        sub={`${data.bills.length} bill${data.bills.length === 1 ? "" : "s"}${paidCount > 0 ? ` · ${paidCount} paid this month` : ""}`} />
 
       {data.bills.length > 0 && <BillCalendar bills={data.bills} />}
 
@@ -1607,9 +1765,18 @@ function Bills({ data, acctById, billsTotal, patch }) {
           <ul className="divide-y divide-stone-100">
             {sorted.map((b) => {
               const a = acctById[b.accountId];
+              const paid = b.paidMonth === thisMK;
               return (
-                <li key={b.id} className="flex items-center justify-between gap-3 py-3">
+                <li key={b.id} className={`flex items-center justify-between gap-3 py-3 ${paid ? "opacity-55" : ""}`}>
                   <div className="flex min-w-0 items-center gap-3">
+                    <button
+                      onClick={() => togglePaid(b)}
+                      title={paid ? "Paid this month — tap to undo" : "Mark paid this month"}
+                      aria-label={paid ? "Mark unpaid" : "Mark paid"}
+                      className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full border-2 transition ${paid ? "border-teal-600 bg-teal-600 text-white" : "border-stone-300 text-transparent hover:border-teal-400"}`}
+                    >
+                      <Check size={14} />
+                    </button>
                     <div className="flex h-10 w-10 shrink-0 flex-col items-center justify-center rounded-xl bg-stone-100">
                       <span className="text-sm font-bold leading-none text-slate-700">{b.day}</span>
                       <span className="uppercase text-slate-400" style={{ fontSize: "9px", lineHeight: 1.4 }}>day</span>
@@ -1617,8 +1784,14 @@ function Bills({ data, acctById, billsTotal, patch }) {
                     <div className="min-w-0">
                       <p className="truncate text-sm font-semibold text-slate-800">{b.name}</p>
                       <div className="flex items-center gap-1.5 text-xs text-slate-400">
-                        {a && <Dot color={a.color} />}
-                        <span className="truncate">{a ? a.name : "—"}</span>
+                        {paid ? (
+                          <span className="font-medium text-teal-600">Paid this month</span>
+                        ) : (
+                          <>
+                            {a && <Dot color={a.color} />}
+                            <span className="truncate">{a ? a.name : "—"}</span>
+                          </>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -2063,6 +2236,8 @@ function Spend({ data, acctById, spentThisMonth, patch }) {
     return Object.entries(m).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
   }, [monthTx]);
 
+  const trends = useMemo(() => categoryTrends(data.transactions), [data.transactions]);
+
   return (
     <div className="space-y-4 lg:columns-2 lg:gap-5 lg:space-y-0 lg:[&>*]:mb-5 lg:[&>*]:break-inside-avoid">
       <SummaryBar label="Spent this month" value={spentThisMonth} sub="not counting bills & loans" />
@@ -2133,6 +2308,41 @@ function Spend({ data, acctById, spentThisMonth, patch }) {
               </li>
             ))}
           </ul>
+        </Card>
+      )}
+
+      {trends.length > 0 && trends.some((t) => t.prev > 0) && (
+        <Card>
+          <Eyebrow>This month vs last</Eyebrow>
+          <p className="mb-3 mt-1 text-sm text-slate-500">How your logged spending compares with last month.</p>
+          <ul className="space-y-2.5">
+            {trends.map((t, i) => {
+              const diff = t.now - t.prev;
+              const pct = t.prev > 0 ? Math.round((diff / t.prev) * 100) : null;
+              const up = diff > 0;
+              return (
+                <li key={t.category} className="flex items-center justify-between gap-2">
+                  <span className="flex min-w-0 items-center gap-2 text-sm text-slate-700">
+                    <Dot color={CATEGORY_COLOURS[t.category] || ACCOUNT_COLORS[i % ACCOUNT_COLORS.length]} />
+                    <span className="truncate">{t.category}</span>
+                  </span>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <span className="text-sm font-semibold tabular-nums text-slate-900">{gbp0(t.now)}</span>
+                    {t.prev === 0 ? (
+                      <span className="rounded-full bg-stone-100 px-2 py-0.5 text-[11px] font-medium text-slate-500">new</span>
+                    ) : Math.abs(diff) < 1 ? (
+                      <span className="rounded-full bg-stone-100 px-2 py-0.5 text-[11px] font-medium text-slate-500">level</span>
+                    ) : (
+                      <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${up ? "bg-rose-50 text-rose-600" : "bg-teal-50 text-teal-700"}`}>
+                        {up ? "↑" : "↓"} {Math.abs(pct)}%
+                      </span>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+          <p className="mt-3 text-[11px] text-slate-400">Based on what you've logged — the more you log, the truer this gets.</p>
         </Card>
       )}
 
@@ -2998,7 +3208,7 @@ function CardItem({ card: c, accounts, onPay, onDelete, onDeletePayment, onEdit 
 /*  SETUP                                                              */
 /* ------------------------------------------------------------------ */
 
-function Setup({ data, patch, onReset, onExample, householdCode, onSignOut }) {
+function Setup({ data, patch, onReset, onExample, onRestore, householdCode, onSignOut }) {
   const [accName, setAccName] = useState("");
   const [accType, setAccType] = useState("Current");
   const [accColor, setAccColor] = useState(ACCOUNT_COLORS[0]);
@@ -3006,6 +3216,45 @@ function Setup({ data, patch, onReset, onExample, householdCode, onSignOut }) {
   const [reserveStr, setReserveStr] = useState(String(data.reserve || ""));
   const [confirmExample, setConfirmExample] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
+  const fileRef = useRef(null);
+  const [restoreMsg, setRestoreMsg] = useState(null);
+
+  const backup = () => {
+    try {
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const el = document.createElement("a");
+      el.href = url;
+      el.download = `money-room-backup-${localISO()}.json`;
+      document.body.appendChild(el);
+      el.click();
+      document.body.removeChild(el);
+      URL.revokeObjectURL(url);
+      setRestoreMsg(null);
+    } catch {
+      setRestoreMsg("Couldn't make the backup file — try this in a browser tab.");
+    }
+  };
+
+  const onFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // let the same file be picked again later
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("bad");
+        if (!window.confirm("Restore this backup? It replaces everything currently in the app.")) return;
+        onRestore(parsed);
+        setRestoreMsg("Restored ✓ — check your accounts and bills look right.");
+      } catch {
+        setRestoreMsg("That file didn't look like a Money Room backup.");
+      }
+    };
+    reader.onerror = () => setRestoreMsg("Couldn't read that file.");
+    reader.readAsText(file);
+  };
   const [editingAcct, setEditingAcct] = useState(null);
   const [newCat, setNewCat] = useState("");
   const [editingCat, setEditingCat] = useState(null);
@@ -3296,6 +3545,20 @@ function Setup({ data, patch, onReset, onExample, householdCode, onSignOut }) {
           Everything is saved privately to this app, just for you — it stays between sessions.
         </p>
         <div className="flex flex-col gap-2">
+          <div className="grid grid-cols-2 gap-2">
+            <button onClick={backup} className={btnGhost}>
+              <ArrowDownCircle size={15} /> Back up
+            </button>
+            <button onClick={() => fileRef.current && fileRef.current.click()} className={btnGhost}>
+              <Upload size={15} /> Restore
+            </button>
+          </div>
+          <input ref={fileRef} type="file" accept="application/json,.json" onChange={onFile} className="hidden" />
+          {restoreMsg && <p className="text-xs text-slate-500">{restoreMsg}</p>}
+          <p className="text-xs text-slate-400">
+            Back up saves a file with all your data; Restore loads one back in. Best done in a browser tab.
+          </p>
+          <div className="my-1 border-t border-stone-100" />
           {confirmExample ? (
             <div className="rounded-xl border border-stone-200 p-3">
               <p className="mb-2 text-sm text-slate-600">Replace everything with the example setup?</p>
