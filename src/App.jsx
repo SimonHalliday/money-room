@@ -2932,20 +2932,6 @@ function LoansTab({ data, drawnThisMonth, patch }) {
     .filter((l) => l.billId && (data.business.bills || []).some((b) => b.id === l.billId))
     .map((l) => l.id);
 
-  /* business accounts handlers */
-  const bAcctAdd = (acct) => patch((d) => { d.business.accounts.push(acct); return d; });
-  const bAcctDel = (id) => patch((d) => { d.business.accounts = d.business.accounts.filter((x) => x.id !== id); return d; });
-  const bAcctBal = (id, val) => patch((d) => {
-    const a = d.business.accounts.find((x) => x.id === id);
-    if (a) { const n = parseFloat(val); a.balance = Number.isFinite(n) ? n : 0; }
-    return d;
-  });
-  const bAcctEdit = (id, vals) => patch((d) => {
-    const a = d.business.accounts.find((x) => x.id === id);
-    if (a) { a.name = vals.name; a.type = vals.type; a.balance = vals.balance; a.isTax = vals.isTax; a.overdraft = vals.overdraft; }
-    return d;
-  });
-
   const biz = data.business;
   const bizCash = biz.accounts.filter((a) => !a.isTax).reduce((s, a) => s + balanceOf(a), 0);
   const bizTaxAside = biz.accounts.filter((a) => a.isTax).reduce((s, a) => s + balanceOf(a), 0);
@@ -3104,15 +3090,6 @@ function LoansTab({ data, drawnThisMonth, patch }) {
             this month. This is a light tracker for cash-flow awareness — your books and accountant
             stay the source of truth for what the company can actually pay out.
           </div>
-
-          {/* business accounts */}
-          <BusinessAccounts
-            accounts={biz.accounts}
-            onAdd={bAcctAdd}
-            onDelete={bAcctDel}
-            onBalance={bAcctBal}
-            onEdit={bAcctEdit}
-          />
 
           {/* business loans */}
           <div>
@@ -3782,6 +3759,19 @@ function Setup({ data, patch, onReset, onExample, onRestore, householdCode, onSi
     patch((d) => { d.reserve = Number.isFinite(v) ? v : 0; return d; });
   };
 
+  const bAcctAdd = (acct) => patch((d) => { d.business.accounts.push(acct); return d; });
+  const bAcctDel = (id) => patch((d) => { d.business.accounts = d.business.accounts.filter((x) => x.id !== id); return d; });
+  const bAcctBal = (id, val) => patch((d) => {
+    const a = d.business.accounts.find((x) => x.id === id);
+    if (a) { const n = parseFloat(val); a.balance = Number.isFinite(n) ? n : 0; }
+    return d;
+  });
+  const bAcctEdit = (id, vals) => patch((d) => {
+    const a = d.business.accounts.find((x) => x.id === id);
+    if (a) { a.name = vals.name; a.type = vals.type; a.balance = vals.balance; a.isTax = vals.isTax; a.overdraft = vals.overdraft; }
+    return d;
+  });
+
   const cats = data.categories?.length ? data.categories : CATEGORIES;
   const addCat = () => {
     const name = newCat.trim();
@@ -3962,6 +3952,16 @@ function Setup({ data, patch, onReset, onExample, onRestore, householdCode, onSi
             });
             setEditingAcct(null);
           }}
+        />
+      )}
+
+      {businessOn && (
+        <BusinessAccounts
+          accounts={data.business?.accounts || []}
+          onAdd={bAcctAdd}
+          onDelete={bAcctDel}
+          onBalance={bAcctBal}
+          onEdit={bAcctEdit}
         />
       )}
 
