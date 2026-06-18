@@ -69,7 +69,7 @@ const EMPTY = {
   cards: [],
   pots: [],
   reserve: 0,
-  business: { accounts: [], loans: [] },
+  business: { accounts: [], loans: [], bills: [] },
   businessEnabled: true,
   categories: [...CATEGORIES],
 };
@@ -398,12 +398,46 @@ const btnGhost =
 
 // A small reusable edit dialog. `fields` describes the inputs; on Save it hands
 // the caller an object of the edited values (number fields parsed to numbers).
+function SignedMoneyInput({ value, onChange }) {
+  const initial = Number(value) || 0;
+  const [neg, setNeg] = useState(initial < 0);
+  const [mag, setMag] = useState(value === "" || value == null ? "" : String(Math.abs(initial)));
+  useEffect(() => {
+    if (value === "" || value == null) { setMag(""); setNeg(false); }
+  }, [value]);
+  const emit = (negVal, magVal) => {
+    const m = parseFloat(magVal);
+    onChange(magVal === "" || !Number.isFinite(m) ? 0 : (negVal ? -Math.abs(m) : Math.abs(m)));
+  };
+  return (
+    <div className="flex items-center gap-2">
+      <button
+        type="button"
+        onClick={() => { const n = !neg; setNeg(n); emit(n, mag); }}
+        title={neg ? "Negative (overdrawn) — tap to flip" : "Positive — tap to flip"}
+        className={`flex h-10 w-12 shrink-0 items-center justify-center rounded-xl border text-lg font-bold transition ${neg ? "border-rose-300 bg-rose-50 text-rose-600" : "border-stone-200 bg-stone-50 text-slate-500"}`}
+      >
+        {neg ? "−" : "+"}
+      </button>
+      <input
+        className={inputCls}
+        type="number"
+        inputMode="decimal"
+        step="0.01"
+        placeholder="0.00"
+        value={mag}
+        onChange={(e) => { setMag(e.target.value); emit(neg, e.target.value); }}
+      />
+    </div>
+  );
+}
+
 function EditModal({ title, fields, item, onSave, onClose }) {
   const [draft, setDraft] = useState(() => {
     const d = {};
     fields.forEach((f) => {
       const v = item ? item[f.key] : undefined;
-      d[f.key] = v ?? (f.type === "select" ? (f.options[0]?.value ?? "") : "");
+      d[f.key] = v ?? (f.type === "select" ? (f.options[0]?.value ?? "") : f.type === "toggle" ? false : "");
     });
     return d;
   });
@@ -436,7 +470,20 @@ function EditModal({ title, fields, item, onSave, onClose }) {
         <div className="space-y-3">
           {fields.map((f) => (
             <Field key={f.key} label={f.label}>
-              {f.type === "select" ? (
+              {f.type === "signedmoney" ? (
+                <SignedMoneyInput value={draft[f.key]} onChange={(v) => set(f.key, v)} />
+              ) : f.type === "toggle" ? (
+                <button
+                  type="button"
+                  onClick={() => set(f.key, !draft[f.key])}
+                  className={`flex w-full items-center justify-between rounded-xl border px-3 py-2 text-sm font-medium transition ${draft[f.key] ? "border-teal-300 bg-teal-50 text-teal-700" : "border-stone-200 bg-stone-50 text-slate-500"}`}
+                >
+                  <span>{draft[f.key] ? "Yes" : "No"}</span>
+                  <span className={`relative inline-block h-5 w-9 rounded-full transition ${draft[f.key] ? "bg-teal-600" : "bg-stone-300"}`}>
+                    <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition ${draft[f.key] ? "translate-x-4" : "translate-x-0.5"}`} />
+                  </span>
+                </button>
+              ) : f.type === "select" ? (
                 <select className={inputCls} value={draft[f.key]} onChange={(e) => set(f.key, e.target.value)}>
                   {f.options.map((o) => (
                     <option key={o.value} value={o.value}>{o.label}</option>
@@ -607,17 +654,34 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
 
   /* ---- personal money ---- */
   const billsTotal = useMemo(() => data.bills.reduce((s, b) => s + (b.amount || 0), 0), [data.bills]);
-  const loansMonthly = useMemo(() => data.loans.reduce((s, l) => s + (l.monthly || 0), 0), [data.loans]);
+  const loansMonthly = useMemo(() => data.loans.filter((l) => !(l.billId && data.bills.some((b) => b.id === l.billId))).reduce((s, l) => s + (l.monthly || 0), 0), [data.loans, data.bills]);
   const spentThisMonth = useMemo(
     () => data.transactions.filter((t) => isThisMonth(t.date)).reduce((s, t) => s + (t.amount || 0), 0),
     [data.transactions]
   );
-  const balancesTotal = useMemo(() => data.accounts.reduce((s, a) => s + balanceOf(a), 0), [data.accounts]);
+  const thisMK = monthKey();
+  const balancesTotal = useMemo(() => data.accounts.filter((a) => !a.isTax).reduce((s, a) => s + balanceOf(a), 0), [data.accounts]);
+  const personalTaxAside = useMemo(() => data.accounts.filter((a) => a.isTax).reduce((s, a) => s + balanceOf(a), 0), [data.accounts]);
+  const bizAccountsList = useMemo(() => (data.business?.accounts || []), [data.business]);
+  const bizAvailable = useMemo(() => bizAccountsList.filter((a) => !a.isTax).reduce((s, a) => s + balanceOf(a), 0), [bizAccountsList]);
+  const bizTaxAside = useMemo(() => bizAccountsList.filter((a) => a.isTax).reduce((s, a) => s + balanceOf(a), 0), [bizAccountsList]);
+  const bizBillsRemaining = useMemo(() => (data.business?.bills || []).filter((b) => dateInThisMonth(nextDue(b.day)) && b.paidMonth !== thisMK).reduce((s, b) => s + (b.amount || 0), 0), [data.business, thisMK]);
+  const bizLoansRemaining = useMemo(() => (data.business?.loans || []).filter((l) => (l.monthly || 0) > 0 && !l.payments.some((p) => isThisMonth(p.date)) && !(l.billId && (data.business?.bills || []).some((b) => b.id === l.billId))).reduce((s, l) => s + (l.monthly || 0), 0), [data.business]);
+  const bizOutgoings = bizBillsRemaining + bizLoansRemaining;
+  const bizSafe = bizAvailable - bizOutgoings;
+  const bizStsBreakdown = useMemo(() => ({
+    balances: bizAvailable,
+    bills: (data.business?.bills || []).filter((b) => dateInThisMonth(nextDue(b.day)) && b.paidMonth !== thisMK).map((b) => ({ name: b.name, amount: b.amount || 0 })),
+    loans: (data.business?.loans || []).filter((l) => (l.monthly || 0) > 0 && !l.payments.some((p) => isThisMonth(p.date)) && !(l.billId && (data.business?.bills || []).some((bb) => bb.id === l.billId))).map((l) => ({ name: l.name, amount: l.monthly || 0 })),
+    pots: [],
+    safe: bizSafe,
+  }), [bizAvailable, data.business, bizSafe, thisMK]);
+  const totalOverdraft = useMemo(() => data.accounts.filter((a) => !a.isTax).reduce((s, a) => s + (Number(a.overdraft) || 0), 0), [data.accounts]);
+  const bizOverdraft = useMemo(() => bizAccountsList.filter((a) => !a.isTax).reduce((s, a) => s + (Number(a.overdraft) || 0), 0), [bizAccountsList]);
   const hasBalances = useMemo(
     () => data.accounts.some((a) => Number.isFinite(a.balance) && a.balance !== 0),
     [data.accounts]
   );
-  const thisMK = monthKey();
   const remainingBills = useMemo(
     () => data.bills.filter((b) => dateInThisMonth(nextDue(b.day)) && b.paidMonth !== thisMK).reduce((s, b) => s + (b.amount || 0), 0),
     [data.bills, thisMK]
@@ -625,13 +689,20 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
   const remainingLoans = useMemo(
     () =>
       data.loans
-        .filter((l) => (l.monthly || 0) > 0 && !l.payments.some((p) => isThisMonth(p.date)))
+        .filter((l) => (l.monthly || 0) > 0 && !l.payments.some((p) => isThisMonth(p.date)) && !(l.billId && data.bills.some((b) => b.id === l.billId)))
         .reduce((s, l) => s + (l.monthly || 0), 0),
-    [data.loans]
+    [data.loans, data.bills]
   );
   const earmarked = useMemo(() => (data.pots || []).reduce((s, p) => s + (p.saved || 0), 0), [data.pots]);
   const remainingThisMonth = remainingBills + remainingLoans;
   const safeToSpend = balancesTotal - remainingThisMonth - earmarked;
+  const stsBreakdown = useMemo(() => ({
+    balances: balancesTotal,
+    bills: data.bills.filter((b) => dateInThisMonth(nextDue(b.day)) && b.paidMonth !== thisMK).map((b) => ({ name: b.name, amount: b.amount || 0 })),
+    loans: data.loans.filter((l) => (l.monthly || 0) > 0 && !l.payments.some((p) => isThisMonth(p.date)) && !(l.billId && data.bills.some((bb) => bb.id === l.billId))).map((l) => ({ name: l.name, amount: l.monthly || 0 })),
+    pots: (data.pots || []).filter((p) => (p.saved || 0) > 0).map((p) => ({ name: p.name, amount: p.saved || 0 })),
+    safe: safeToSpend,
+  }), [balancesTotal, data.bills, data.loans, data.pots, safeToSpend, thisMK]);
   const committedMonthly = billsTotal + loansMonthly;
 
   const reserve = Number.isFinite(data.reserve) ? data.reserve : 0;
@@ -774,7 +845,17 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
             {tab === "home" && (
               <Home
                 safeToSpend={safeToSpend}
+                breakdown={stsBreakdown}
                 balancesTotal={balancesTotal}
+                personalTaxAside={personalTaxAside}
+                bizAvailable={bizAvailable}
+                bizSafe={bizSafe}
+                bizOutgoings={bizOutgoings}
+                bizBreakdown={bizStsBreakdown}
+                bizTaxAside={bizTaxAside}
+                bizAccountsList={bizAccountsList}
+                totalOverdraft={totalOverdraft}
+                bizOverdraft={bizOverdraft}
                 remainingThisMonth={remainingThisMonth}
                 earmarked={earmarked}
                 hasBalances={hasBalances}
@@ -891,13 +972,58 @@ function FirstRun({ onSetup, onExample }) {
 /*  HOME                                                               */
 /* ------------------------------------------------------------------ */
 
+function StsBreakdownCard({ breakdown, accountsLabel = "In your spendable accounts" }) {
+  const bills = breakdown.bills || [];
+  const loans = breakdown.loans || [];
+  const pots = breakdown.pots || [];
+  return (
+    <Card>
+      <Eyebrow>How "safe to spend" is worked out</Eyebrow>
+      <div className="mt-2.5 space-y-1.5 text-sm">
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-slate-600">{accountsLabel}</span>
+          <span className="shrink-0 font-semibold tabular-nums text-slate-900">{gbp(breakdown.balances)}</span>
+        </div>
+        {bills.map((b, i) => (
+          <div key={"b" + i} className="flex items-center justify-between gap-3">
+            <span className="min-w-0 truncate text-slate-500">{b.name} <span className="text-slate-400">· bill this month</span></span>
+            <span className="shrink-0 tabular-nums text-rose-600">−{gbp(b.amount)}</span>
+          </div>
+        ))}
+        {loans.map((l, i) => (
+          <div key={"l" + i} className="flex items-center justify-between gap-3">
+            <span className="min-w-0 truncate text-slate-500">{l.name} <span className="text-slate-400">· loan payment this month</span></span>
+            <span className="shrink-0 tabular-nums text-rose-600">−{gbp(l.amount)}</span>
+          </div>
+        ))}
+        {pots.map((p, i) => (
+          <div key={"p" + i} className="flex items-center justify-between gap-3">
+            <span className="min-w-0 truncate text-slate-500">{p.name} <span className="text-slate-400">· set aside in a pot</span></span>
+            <span className="shrink-0 tabular-nums text-rose-600">−{gbp(p.amount)}</span>
+          </div>
+        ))}
+        {bills.length === 0 && loans.length === 0 && pots.length === 0 && (
+          <p className="text-xs text-slate-400">Nothing's being held back — your safe-to-spend is simply what's in your accounts.</p>
+        )}
+        <div className="mt-1 flex items-center justify-between gap-3 border-t border-stone-100 pt-2 font-bold">
+          <span className="text-slate-800">Safe to spend</span>
+          <span className="shrink-0 tabular-nums text-slate-900">{gbp(breakdown.safe)}</span>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 function Home({
-  safeToSpend, balancesTotal, remainingThisMonth, earmarked, hasBalances,
+  safeToSpend, balancesTotal, remainingThisMonth, earmarked, hasBalances, breakdown,
+  personalTaxAside = 0, bizAvailable = 0, bizSafe = 0, bizOutgoings = 0, bizBreakdown = null, bizTaxAside = 0, bizAccountsList = [], totalOverdraft = 0, bizOverdraft = 0,
   reserve, projection, projected, shortfall, nudges, pots, accounts, onAddPot, onDeletePot, onMovePot, onEditPot,
   drawnThisMonth, drawnTaxYear, drawsByType, committedMonthly, billsTotal, loansMonthly,
   upcoming, perAccount, acctById, onGoSetup, onGoIncome, businessOn,
 }) {
   const monthName = new Date().toLocaleDateString("en-GB", { month: "long" });
+  const [showBreakdown, setShowBreakdown] = useState(false);
+  const [showBizBreakdown, setShowBizBreakdown] = useState(false);
   const positive = safeToSpend >= 0;
   const stillToGo = upcoming.reduce((s, b) => s + (b.amount || 0), 0);
   const hasReserve = reserve > 0;
@@ -927,14 +1053,63 @@ function Home({
           </>
         ) : (
           <>
-            <p className="mt-1 text-5xl font-bold tabular-nums tracking-tight">{gbp(safeToSpend)}</p>
+            <button onClick={() => setShowBreakdown((v) => !v)} className="mt-1 block text-left">
+              <span className="text-5xl font-bold tabular-nums tracking-tight">{gbp(safeToSpend)}</span>
+              <span className="ml-2 align-middle text-xs underline decoration-white/40 underline-offset-2" style={{ color: "rgba(255,255,255,0.75)" }}>
+                {showBreakdown ? "hide" : "how's this worked out?"}
+              </span>
+            </button>
             <p className="mt-3 text-sm leading-relaxed" style={{ color: "rgba(255,255,255,0.85)" }}>
               {gbp0(balancesTotal)} in your accounts, minus {gbp0(remainingThisMonth)} still
               to leave this month{earmarked > 0 ? `, minus ${gbp0(earmarked)} you've set aside` : ""}.
             </p>
+            {personalTaxAside > 0 && (
+              <p className="mt-2 text-xs" style={{ color: "rgba(255,255,255,0.7)" }}>
+                Plus {gbp0(personalTaxAside)} held for VAT/tax — kept out of this number.
+              </p>
+            )}
+            {totalOverdraft > 0 && (
+              <p className="mt-1 text-xs" style={{ color: "rgba(255,255,255,0.7)" }}>
+                Plus {gbp0(totalOverdraft)} overdraft available if you need it.
+              </p>
+            )}
           </>
         )}
       </div>
+
+      {showBreakdown && breakdown && <StsBreakdownCard breakdown={breakdown} />}
+
+      {businessOn && bizAccountsList.length > 0 && (
+        <Card>
+          <div className="flex items-center gap-2">
+            <Briefcase size={15} className="text-teal-600" />
+            <Eyebrow>Business — safe to spend</Eyebrow>
+          </div>
+          <button onClick={() => setShowBizBreakdown((v) => !v)} className="mt-2 block text-left">
+            <span className={`text-4xl font-bold tabular-nums tracking-tight ${bizSafe >= 0 ? "text-slate-900" : "text-rose-600"}`}>{gbp(bizSafe)}</span>
+            <span className="ml-2 align-middle text-xs text-slate-400 underline decoration-slate-300 underline-offset-2">
+              {showBizBreakdown ? "hide" : "how's this worked out?"}
+            </span>
+          </button>
+          <p className="mt-1 text-sm text-slate-500">
+            {gbp0(bizAvailable)} in the business{bizOutgoings > 0 ? `, minus ${gbp0(bizOutgoings)} of bills & loans still to leave this month` : ""}.
+          </p>
+          {bizTaxAside > 0 && (
+            <p className="mt-1 text-xs text-slate-400">
+              Plus {gbp0(bizTaxAside)} held for VAT/tax — kept aside.
+            </p>
+          )}
+          {bizOverdraft > 0 && (
+            <p className="mt-1 text-xs text-slate-400">
+              Plus {gbp0(bizOverdraft)} overdraft available if needed.
+            </p>
+          )}
+        </Card>
+      )}
+
+      {businessOn && bizAccountsList.length > 0 && showBizBreakdown && bizBreakdown && (
+        <StsBreakdownCard breakdown={bizBreakdown} accountsLabel="In the business accounts" />
+      )}
 
       {/* The month ahead — forward projection */}
       {hasBalances && projection && projection.points.some((p) => p.drop > 0) && (
@@ -1681,58 +1856,68 @@ function BillCalendar({ bills }) {
   );
 }
 
-function Bills({ data, acctById, billsTotal, patch }) {
+function BillsPane({ bills, accounts, patch, scope }) {
+  const isBiz = scope === "business";
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [amount, setAmount] = useState("");
   const [day, setDay] = useState("1");
-  const [accountId, setAccountId] = useState(data.accounts[0]?.id || "");
+  const [accountId, setAccountId] = useState(accounts[0]?.id || "");
   const [editing, setEditing] = useState(null);
+  const thisMK = monthKey();
+  const acctById = Object.fromEntries(accounts.map((a) => [a.id, a]));
+
+  const getArr = (d) => {
+    if (isBiz) { if (!d.business.bills) d.business.bills = []; return d.business.bills; }
+    return d.bills;
+  };
 
   const add = () => {
     const amt = parseFloat(amount);
     if (!name.trim() || !Number.isFinite(amt)) return;
     patch((d) => {
-      d.bills.push({
+      getArr(d).push({
         id: uid(), name: name.trim(), amount: amt,
         day: Math.min(31, Math.max(1, parseInt(day) || 1)),
-        accountId: accountId || data.accounts[0]?.id || "",
+        accountId: accountId || accounts[0]?.id || "", paidMonth: "",
       });
       return d;
     });
     setName(""); setAmount(""); setDay("1"); setOpen(false);
   };
 
-  const sorted = [...data.bills].sort((a, b) => a.day - b.day);
-  const thisMK = monthKey();
+  const sorted = [...bills].sort((a, b) => a.day - b.day);
+  const total = bills.reduce((s, b) => s + (b.amount || 0), 0);
   const togglePaid = (b) =>
     patch((d) => {
-      const x = d.bills.find((y) => y.id === b.id);
+      const x = getArr(d).find((y) => y.id === b.id);
       if (x) x.paidMonth = x.paidMonth === thisMK ? "" : thisMK;
       return d;
     });
+  const del = (id) =>
+    patch((d) => { const arr = getArr(d); const i = arr.findIndex((x) => x.id === id); if (i >= 0) arr.splice(i, 1); return d; });
   const paidCount = sorted.filter((b) => b.paidMonth === thisMK).length;
 
   return (
     <div className="space-y-4 lg:columns-2 lg:gap-5 lg:space-y-0 lg:[&>*]:mb-5 lg:[&>*]:break-inside-avoid">
-      <SummaryBar label="Regular bills, every month" value={billsTotal}
-        sub={`${data.bills.length} bill${data.bills.length === 1 ? "" : "s"}${paidCount > 0 ? ` · ${paidCount} paid this month` : ""}`} />
+      <SummaryBar label={isBiz ? "Business bills, every month" : "Regular bills, every month"} value={total}
+        sub={`${bills.length} bill${bills.length === 1 ? "" : "s"}${paidCount > 0 ? ` · ${paidCount} paid this month` : ""}`} />
 
-      {data.bills.length > 0 && <BillCalendar bills={data.bills} />}
+      {bills.length > 0 && <BillCalendar bills={bills} />}
 
       {!open ? (
         <button onClick={() => setOpen(true)} className={`${btnPrimary} w-full`}>
-          <Plus size={16} /> Add a bill
+          <Plus size={16} /> Add a {isBiz ? "business bill" : "bill"}
         </button>
       ) : (
         <Card>
           <div className="mb-3 flex items-center justify-between">
-            <Eyebrow>New bill</Eyebrow>
+            <Eyebrow>{isBiz ? "New business bill" : "New bill"}</Eyebrow>
             <button onClick={() => setOpen(false)} className="text-slate-400"><X size={18} /></button>
           </div>
           <div className="space-y-3">
             <Field label="What is it?">
-              <input className={inputCls} placeholder="e.g. Council tax" value={name} onChange={(e) => setName(e.target.value)} />
+              <input className={inputCls} placeholder={isBiz ? "e.g. Software, insurance" : "e.g. Council tax"} value={name} onChange={(e) => setName(e.target.value)} />
             </Field>
             <div className="grid grid-cols-2 gap-3">
               <Field label="Amount (£)">
@@ -1744,11 +1929,13 @@ function Bills({ data, acctById, billsTotal, patch }) {
                   value={day} onChange={(e) => setDay(e.target.value)} />
               </Field>
             </div>
-            <Field label="Comes out of">
-              <select className={inputCls} value={accountId} onChange={(e) => setAccountId(e.target.value)}>
-                {data.accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
-              </select>
-            </Field>
+            {accounts.length > 0 && (
+              <Field label="Comes out of">
+                <select className={inputCls} value={accountId} onChange={(e) => setAccountId(e.target.value)}>
+                  {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                </select>
+              </Field>
+            )}
             <button onClick={add} className={`${btnPrimary} w-full`}>
               <Check size={16} /> Save bill
             </button>
@@ -1759,8 +1946,9 @@ function Bills({ data, acctById, billsTotal, patch }) {
       <Card>
         {sorted.length === 0 ? (
           <p className="py-6 text-center text-sm text-slate-400">
-            No bills yet. Add the ones that leave automatically — direct debits,
-            standing orders, subscriptions.
+            {isBiz
+              ? "No business bills yet. Add the company's regular outgoings — software, insurance, subscriptions, rent."
+              : "No bills yet. Add the ones that leave automatically — direct debits, standing orders, subscriptions."}
           </p>
         ) : (
           <ul className="divide-y divide-stone-100">
@@ -1800,7 +1988,7 @@ function Bills({ data, acctById, billsTotal, patch }) {
                     <span className="text-sm font-bold tabular-nums text-slate-900">{gbp(b.amount)}</span>
                     <EditBtn onClick={() => setEditing(b)} />
                     <button
-                      onClick={() => patch((d) => { d.bills = d.bills.filter((x) => x.id !== b.id); return d; })}
+                      onClick={() => del(b.id)}
                       className="text-slate-300 hover:text-rose-500"
                     >
                       <Trash2 size={16} />
@@ -1815,24 +2003,55 @@ function Bills({ data, acctById, billsTotal, patch }) {
 
       {editing && (
         <EditModal
-          title="Edit bill"
+          title={isBiz ? "Edit business bill" : "Edit bill"}
           item={editing}
           fields={[
             { key: "name", label: "What is it?", type: "text" },
             { key: "amount", label: "Amount (£)", type: "money" },
             { key: "day", label: "Day of month", type: "number" },
-            { key: "accountId", label: "Comes out of", type: "select", options: data.accounts.map((a) => ({ value: a.id, label: a.name })) },
+            ...(accounts.length > 0 ? [{ key: "accountId", label: "Comes out of", type: "select", options: accounts.map((a) => ({ value: a.id, label: a.name })) }] : []),
           ]}
           onClose={() => setEditing(null)}
           onSave={(vals) => {
             patch((d) => {
-              const b = d.bills.find((x) => x.id === editing.id);
+              const b = getArr(d).find((x) => x.id === editing.id);
               if (b) { b.name = vals.name; b.amount = vals.amount; b.day = Math.min(31, Math.max(1, vals.day || 1)); b.accountId = vals.accountId; }
               return d;
             });
             setEditing(null);
           }}
         />
+      )}
+    </div>
+  );
+}
+
+function Bills({ data, patch }) {
+  const businessOn = data.businessEnabled !== false;
+  const [seg, setSeg] = useState("personal");
+  const showBiz = businessOn && seg === "business";
+  return (
+    <div className="space-y-4">
+      {businessOn && (
+        <div className="flex rounded-2xl bg-stone-100 p-1">
+          <button
+            onClick={() => setSeg("personal")}
+            className={`flex flex-1 items-center justify-center gap-1.5 rounded-xl py-2 text-sm font-semibold transition ${seg === "personal" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
+          >
+            <Wallet size={15} /> Personal
+          </button>
+          <button
+            onClick={() => setSeg("business")}
+            className={`flex flex-1 items-center justify-center gap-1.5 rounded-xl py-2 text-sm font-semibold transition ${seg === "business" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}
+          >
+            <Briefcase size={15} /> Business
+          </button>
+        </div>
+      )}
+      {showBiz ? (
+        <BillsPane bills={data.business?.bills || []} accounts={data.business?.accounts || []} patch={patch} scope="business" />
+      ) : (
+        <BillsPane bills={data.bills} accounts={data.accounts} patch={patch} scope="personal" />
       )}
     </div>
   );
@@ -2425,7 +2644,7 @@ function Spend({ data, acctById, spentThisMonth, patch }) {
 /*  LOANS — generic list                                              */
 /* ------------------------------------------------------------------ */
 
-function LoanList({ loans, accounts, onAdd, onDelete, onLogPayment, onDeletePayment, onEdit, emptyText }) {
+function LoanList({ loans, accounts, onAdd, onDelete, onLogPayment, onDeletePayment, onEdit, emptyText, onAddToBills, linkedIds = [] }) {
   const acctById = useMemo(() => {
     const m = {};
     accounts.forEach((a) => (m[a.id] = a));
@@ -2439,6 +2658,9 @@ function LoanList({ loans, accounts, onAdd, onDelete, onLogPayment, onDeletePaym
   const [apr, setApr] = useState("");
   const [accountId, setAccountId] = useState(accounts[0]?.id || "");
   const [editing, setEditing] = useState(null);
+  const [billFor, setBillFor] = useState(null);
+  const [billDay, setBillDay] = useState("1");
+  const [billAcct, setBillAcct] = useState("");
 
   const add = () => {
     const orig = parseFloat(original);
@@ -2561,6 +2783,39 @@ function LoanList({ loans, accounts, onAdd, onDelete, onLogPayment, onDeletePaym
                 </button>
               </div>
 
+              {onAddToBills && l.monthly > 0 && (
+                linkedIds.includes(l.id) ? (
+                  <p className="mt-2 text-center text-xs font-medium text-teal-600">✓ Monthly payment is in your Bills</p>
+                ) : billFor === l.id ? (
+                  <div className="mt-2 space-y-2 rounded-xl border border-stone-200 p-2.5">
+                    <div className="flex items-center gap-2">
+                      <span className="shrink-0 text-xs text-slate-500">Leaves on day</span>
+                      <input type="number" min="1" max="31" value={billDay} onChange={(e) => setBillDay(e.target.value)}
+                        className="w-14 rounded-lg border border-stone-200 px-2 py-1 text-center text-sm" />
+                    </div>
+                    {accounts.length > 0 && (
+                      <label className="block">
+                        <span className="mb-1 block text-xs text-slate-500">Comes out of</span>
+                        <select value={billAcct} onChange={(e) => setBillAcct(e.target.value)}
+                          className="w-full rounded-lg border border-stone-200 px-2 py-1.5 text-sm">
+                          {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                        </select>
+                      </label>
+                    )}
+                    <div className="flex gap-2">
+                      <button onClick={() => setBillFor(null)} className="flex-1 rounded-lg border border-stone-200 px-2.5 py-1.5 text-xs font-medium text-slate-500">Cancel</button>
+                      <button onClick={() => { onAddToBills(l, parseInt(billDay) || 1, billAcct || l.accountId || accounts[0]?.id || ""); setBillFor(null); }}
+                        className="flex-1 rounded-lg bg-teal-600 px-2.5 py-1.5 text-xs font-semibold text-white">Add to Bills</button>
+                    </div>
+                  </div>
+                ) : (
+                  <button onClick={() => { setBillFor(l.id); setBillDay("1"); setBillAcct(l.accountId || accounts[0]?.id || ""); }}
+                    className="mt-2 w-full text-center text-xs font-medium text-teal-600 hover:underline">
+                    + Add {gbp0(l.monthly)} monthly payment to Bills
+                  </button>
+                )
+              )}
+
               {l.payments.length > 0 && (
                 <ul className="mt-3 space-y-1.5 border-t border-stone-100 pt-3">
                   {[...l.payments].reverse().slice(0, 6).map((p) => (
@@ -2628,6 +2883,20 @@ function LoansTab({ data, drawnThisMonth, patch }) {
     if (l) { l.name = vals.name; l.original = vals.original; l.monthly = vals.monthly; l.apr = vals.apr; l.accountId = vals.accountId; }
     return d;
   });
+  const addLoanToBills = (loan, day, accountId) => patch((d) => {
+    const billId = uid();
+    d.bills.push({
+      id: billId, name: loan.name, amount: loan.monthly || 0,
+      day: Math.min(31, Math.max(1, day || 1)),
+      accountId: accountId || loan.accountId || d.accounts[0]?.id || "", paidMonth: "",
+    });
+    const l = d.loans.find((x) => x.id === loan.id);
+    if (l) l.billId = billId;
+    return d;
+  });
+  const personalLinkedLoanIds = data.loans
+    .filter((l) => l.billId && data.bills.some((b) => b.id === l.billId))
+    .map((l) => l.id);
 
   /* business loan handlers */
   const bAdd = (loan) => patch((d) => { d.business.loans.push(loan); return d; });
@@ -2647,6 +2916,21 @@ function LoansTab({ data, drawnThisMonth, patch }) {
     if (l) { l.name = vals.name; l.original = vals.original; l.monthly = vals.monthly; l.apr = vals.apr; l.accountId = vals.accountId; }
     return d;
   });
+  const bizAddLoanToBills = (loan, day, accountId) => patch((d) => {
+    if (!d.business.bills) d.business.bills = [];
+    const billId = uid();
+    d.business.bills.push({
+      id: billId, name: loan.name, amount: loan.monthly || 0,
+      day: Math.min(31, Math.max(1, day || 1)),
+      accountId: accountId || loan.accountId || d.business.accounts[0]?.id || "", paidMonth: "",
+    });
+    const l = d.business.loans.find((x) => x.id === loan.id);
+    if (l) l.billId = billId;
+    return d;
+  });
+  const bizLinkedLoanIds = (data.business.loans || [])
+    .filter((l) => l.billId && (data.business.bills || []).some((b) => b.id === l.billId))
+    .map((l) => l.id);
 
   /* business accounts handlers */
   const bAcctAdd = (acct) => patch((d) => { d.business.accounts.push(acct); return d; });
@@ -2658,18 +2942,23 @@ function LoansTab({ data, drawnThisMonth, patch }) {
   });
   const bAcctEdit = (id, vals) => patch((d) => {
     const a = d.business.accounts.find((x) => x.id === id);
-    if (a) { a.name = vals.name; a.type = vals.type; a.balance = vals.balance; }
+    if (a) { a.name = vals.name; a.type = vals.type; a.balance = vals.balance; a.isTax = vals.isTax; a.overdraft = vals.overdraft; }
     return d;
   });
 
   const biz = data.business;
-  const bizCash = biz.accounts.reduce((s, a) => s + balanceOf(a), 0);
+  const bizCash = biz.accounts.filter((a) => !a.isTax).reduce((s, a) => s + balanceOf(a), 0);
+  const bizTaxAside = biz.accounts.filter((a) => a.isTax).reduce((s, a) => s + balanceOf(a), 0);
   const bizOwed = biz.loans.reduce((s, l) => s + owedOn(l), 0);
   const bizMonthly = biz.loans.reduce((s, l) => s + (l.monthly || 0), 0);
   const bizRemaining = biz.loans
-    .filter((l) => (l.monthly || 0) > 0 && !l.payments.some((p) => isThisMonth(p.date)))
+    .filter((l) => (l.monthly || 0) > 0 && !l.payments.some((p) => isThisMonth(p.date)) && !(l.billId && (biz.bills || []).some((b) => b.id === l.billId)))
     .reduce((s, l) => s + (l.monthly || 0), 0);
-  const bizHeadroom = bizCash - bizRemaining;
+  const bizBills = biz.bills || [];
+  const bizBillsRemaining = bizBills
+    .filter((b) => dateInThisMonth(nextDue(b.day)) && b.paidMonth !== monthKey())
+    .reduce((s, b) => s + (b.amount || 0), 0);
+  const bizHeadroom = bizCash - bizRemaining - bizBillsRemaining;
 
   /* combined debt picture (personal + business + cards) */
   const cards = data.cards || [];
@@ -2679,12 +2968,13 @@ function LoansTab({ data, drawnThisMonth, patch }) {
   const pMonthly = data.loans.reduce((s, l) => s + (l.monthly || 0), 0);
   const bPaid = sumPaid(biz.loans);
   const cardsOwed = cards.reduce((s, c) => s + Math.max(0, c.balance || 0), 0);
+  const cardsMonthly = cards.reduce((s, c) => s + (c.minPayment || 0), 0);
   const loansOwed = pOwed + bizOwed;
   const loansPaid = pPaid + bPaid;
   const totalOwed = loansOwed + cardsOwed;
   const loanOriginal = loansOwed + loansPaid;
   const paidPct = loanOriginal > 0 ? (loansPaid / loanOriginal) * 100 : 0;
-  const totalMonthly = pMonthly + bizMonthly;
+  const totalMonthly = pMonthly + bizMonthly + cardsMonthly;
   const anyDebt = data.loans.length + biz.loans.length + cards.length > 0;
 
   return (
@@ -2699,7 +2989,7 @@ function LoansTab({ data, drawnThisMonth, patch }) {
             </div>
             <div className="text-right">
               <p className="text-xl font-bold tabular-nums text-slate-700">{gbp0(totalMonthly)}</p>
-              <p className="text-xs text-slate-400">/mo to loans</p>
+              <p className="text-xs text-slate-400">/mo across all debt</p>
             </div>
           </div>
 
@@ -2719,19 +3009,28 @@ function LoansTab({ data, drawnThisMonth, patch }) {
               <span className="flex items-center gap-2 text-sm font-medium text-slate-600">
                 <Wallet size={15} /> Personal loans
               </span>
-              <span className="text-sm font-bold tabular-nums text-slate-900">{gbp0(pOwed)}</span>
+              <span className="text-right">
+                <span className="block text-sm font-bold tabular-nums text-slate-900">{gbp0(pOwed)}</span>
+                {pMonthly > 0 && <span className="block text-xs text-slate-400">{gbp0(pMonthly)}/mo</span>}
+              </span>
             </li>
             <li className="flex items-center justify-between rounded-2xl bg-stone-50 px-3 py-2.5">
               <span className="flex items-center gap-2 text-sm font-medium text-slate-600">
                 <Briefcase size={15} /> Business loans
               </span>
-              <span className="text-sm font-bold tabular-nums text-slate-900">{gbp0(bizOwed)}</span>
+              <span className="text-right">
+                <span className="block text-sm font-bold tabular-nums text-slate-900">{gbp0(bizOwed)}</span>
+                {bizMonthly > 0 && <span className="block text-xs text-slate-400">{gbp0(bizMonthly)}/mo</span>}
+              </span>
             </li>
             <li className="flex items-center justify-between rounded-2xl bg-stone-50 px-3 py-2.5">
               <span className="flex items-center gap-2 text-sm font-medium text-slate-600">
                 <CreditCard size={15} /> Credit cards
               </span>
-              <span className="text-sm font-bold tabular-nums text-slate-900">{gbp0(cardsOwed)}</span>
+              <span className="text-right">
+                <span className="block text-sm font-bold tabular-nums text-slate-900">{gbp0(cardsOwed)}</span>
+                {cardsMonthly > 0 && <span className="block text-xs text-slate-400">{gbp0(cardsMonthly)}/mo min</span>}
+              </span>
             </li>
           </ul>
         </Card>
@@ -2779,6 +3078,8 @@ function LoansTab({ data, drawnThisMonth, patch }) {
             onLogPayment={pPay}
             onDeletePayment={pPayDel}
             onEdit={pEdit}
+            onAddToBills={addLoanToBills}
+            linkedIds={personalLinkedLoanIds}
             emptyText="No personal debts tracked yet. Add one to watch the balance shrink every time you log a payment."
           />
         </>
@@ -2786,12 +3087,17 @@ function LoansTab({ data, drawnThisMonth, patch }) {
         <>
           {/* business overview */}
           <div className="grid grid-cols-2 gap-3">
-            <Stat label="Business cash" value={gbp0(bizCash)} accent="text-cyan-700" />
+            <Stat label="Business available" value={gbp0(bizCash)} accent="text-cyan-700" />
             <Stat label="Total owed" value={gbp0(bizOwed)} accent="text-slate-900" />
             <Stat label="Loans per month" value={gbp0(bizMonthly)} accent="text-slate-900" />
             <Stat label="Headroom this month" value={gbp0(bizHeadroom)}
               accent={bizHeadroom >= 0 ? "text-teal-700" : "text-rose-600"} />
           </div>
+          {bizTaxAside > 0 && (
+            <p className="mt-2 text-xs text-slate-400">
+              Plus {gbp0(bizTaxAside)} held in VAT/tax accounts — kept out of the figures above.
+            </p>
+          )}
 
           <div className="rounded-2xl border border-cyan-200 bg-cyan-50 p-3.5 text-xs leading-relaxed text-cyan-900">
             You've taken <span className="font-semibold">{gbp0(drawnThisMonth)}</span> out to yourself
@@ -2821,14 +3127,148 @@ function LoansTab({ data, drawnThisMonth, patch }) {
               onLogPayment={bPay}
               onDeletePayment={bPayDel}
               onEdit={bEdit}
+              onAddToBills={bizAddLoanToBills}
+              linkedIds={bizLinkedLoanIds}
               emptyText="No business loans tracked yet. Add your equipment finance, asset finance and any business loans here."
             />
           </div>
         </>
       ) : (
-        <CardsSection cards={cards} accounts={data.accounts} patch={patch} />
+        <CardsSection cards={cards} accounts={data.accounts} bills={data.bills} patch={patch} />
       )}
     </div>
+  );
+}
+
+function BusinessBills({ bills, accounts, patch }) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [amount, setAmount] = useState("");
+  const [day, setDay] = useState("1");
+  const [accountId, setAccountId] = useState(accounts[0]?.id || "");
+  const [editing, setEditing] = useState(null);
+  const thisMK = monthKey();
+  const acctById = Object.fromEntries(accounts.map((a) => [a.id, a]));
+
+  const add = () => {
+    const amt = parseFloat(amount);
+    if (!name.trim() || !Number.isFinite(amt)) return;
+    patch((d) => {
+      if (!d.business.bills) d.business.bills = [];
+      d.business.bills.push({
+        id: uid(), name: name.trim(), amount: amt,
+        day: Math.min(31, Math.max(1, parseInt(day) || 1)),
+        accountId: accountId || accounts[0]?.id || "", paidMonth: "",
+      });
+      return d;
+    });
+    setName(""); setAmount(""); setDay("1"); setOpen(false);
+  };
+  const togglePaid = (b) => patch((d) => {
+    const x = (d.business.bills || []).find((y) => y.id === b.id);
+    if (x) x.paidMonth = x.paidMonth === thisMK ? "" : thisMK;
+    return d;
+  });
+  const del = (id) => patch((d) => { d.business.bills = (d.business.bills || []).filter((x) => x.id !== id); return d; });
+  const saveEdit = (vals) => {
+    patch((d) => {
+      const b = (d.business.bills || []).find((x) => x.id === editing.id);
+      if (b) { b.name = vals.name; b.amount = vals.amount; b.day = Math.min(31, Math.max(1, vals.day || 1)); b.accountId = vals.accountId; }
+      return d;
+    });
+    setEditing(null);
+  };
+
+  const sorted = [...bills].sort((a, b) => a.day - b.day);
+  const total = bills.reduce((s, b) => s + (b.amount || 0), 0);
+  const paidCount = sorted.filter((b) => b.paidMonth === thisMK).length;
+
+  return (
+    <Card>
+      <div className="flex items-center justify-between">
+        <Eyebrow>Business bills</Eyebrow>
+        <span className="text-xs tabular-nums text-slate-400">
+          {gbp0(total)}/mo{paidCount > 0 ? ` · ${paidCount} paid` : ""}
+        </span>
+      </div>
+      {sorted.length > 0 && (
+        <ul className="mb-3 mt-3 divide-y divide-stone-100">
+          {sorted.map((b) => {
+            const a = acctById[b.accountId];
+            const paid = b.paidMonth === thisMK;
+            return (
+              <li key={b.id} className={`flex items-center justify-between gap-3 py-2.5 ${paid ? "opacity-55" : ""}`}>
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <button
+                    onClick={() => togglePaid(b)}
+                    title={paid ? "Paid this month — tap to undo" : "Mark paid this month"}
+                    className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 transition ${paid ? "border-teal-600 bg-teal-600 text-white" : "border-stone-300 text-transparent hover:border-teal-400"}`}
+                  >
+                    <Check size={12} />
+                  </button>
+                  <div className="flex h-8 w-8 shrink-0 flex-col items-center justify-center rounded-lg bg-stone-100">
+                    <span className="text-xs font-bold leading-none text-slate-700">{b.day}</span>
+                  </div>
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium text-slate-800">{b.name}</p>
+                    <p className="truncate text-xs text-slate-400">{paid ? "Paid this month" : (a ? a.name : "—")}</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-semibold tabular-nums text-slate-900">{gbp(b.amount)}</span>
+                  <EditBtn onClick={() => setEditing(b)} />
+                  <button onClick={() => del(b.id)} className="text-slate-300 hover:text-rose-500"><Trash2 size={15} /></button>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {!open ? (
+        <button onClick={() => setOpen(true)} className={`${btnGhost} mt-3 w-full`}>
+          <Plus size={15} /> Add a business bill
+        </button>
+      ) : (
+        <div className="mt-3 space-y-3 rounded-xl border border-stone-200 p-3">
+          <Field label="What is it?">
+            <input className={inputCls} placeholder="e.g. Software, insurance" value={name} onChange={(e) => setName(e.target.value)} />
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Amount (£)">
+              <input className={inputCls} type="number" inputMode="decimal" placeholder="0.00" value={amount} onChange={(e) => setAmount(e.target.value)} />
+            </Field>
+            <Field label="Day of month">
+              <input className={inputCls} type="number" inputMode="numeric" min="1" max="31" value={day} onChange={(e) => setDay(e.target.value)} />
+            </Field>
+          </div>
+          {accounts.length > 0 && (
+            <Field label="Comes out of">
+              <select className={inputCls} value={accountId} onChange={(e) => setAccountId(e.target.value)}>
+                {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+              </select>
+            </Field>
+          )}
+          <div className="flex gap-2">
+            <button onClick={() => setOpen(false)} className={`${btnGhost} flex-1`}>Cancel</button>
+            <button onClick={add} className={`${btnPrimary} flex-1`}><Check size={15} /> Save</button>
+          </div>
+        </div>
+      )}
+      {editing && (
+        <EditModal
+          title="Edit business bill"
+          item={editing}
+          fields={[
+            { key: "name", label: "What is it?", type: "text" },
+            { key: "amount", label: "Amount (£)", type: "money" },
+            { key: "day", label: "Day of month", type: "number" },
+            ...(accounts.length > 0 ? [{ key: "accountId", label: "Comes out of", type: "select", options: accounts.map((a) => ({ value: a.id, label: a.name })) }] : []),
+          ]}
+          onClose={() => setEditing(null)}
+          onSave={saveEdit}
+        />
+      )}
+    </Card>
   );
 }
 
@@ -2859,7 +3299,9 @@ function BusinessAccounts({ accounts, onAdd, onDelete, onBalance, onEdit }) {
                   <Dot color={a.color} />
                   <div>
                     <p className="text-sm font-medium text-slate-800">{a.name}</p>
-                    <p className="text-xs text-slate-400">{a.type}</p>
+                    <p className="text-xs text-slate-400">
+                      {a.type}{a.isTax && <span className="ml-1.5 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">VAT/tax</span>}
+                    </p>
                   </div>
                 </div>
                 <div className="flex items-center gap-1">
@@ -2923,7 +3365,9 @@ function BusinessAccounts({ accounts, onAdd, onDelete, onBalance, onEdit }) {
           fields={[
             { key: "name", label: "Account name", type: "text" },
             { key: "type", label: "Type", type: "select", options: ["Current", "Savings", "Other"].map((t) => ({ value: t, label: t })) },
-            { key: "balance", label: "Balance now (£)", type: "money" },
+            { key: "balance", label: "Balance now (£) — use − if overdrawn", type: "signedmoney" },
+            { key: "overdraft", label: "Overdraft limit (£, if any)", type: "money" },
+            { key: "isTax", label: "VAT/tax savings account (kept aside)", type: "toggle" },
           ]}
           onClose={() => setEditing(null)}
           onSave={(vals) => { onEdit(editing.id, vals); setEditing(null); }}
@@ -2937,7 +3381,7 @@ function BusinessAccounts({ accounts, onAdd, onDelete, onBalance, onEdit }) {
 /*  CREDIT CARDS                                                       */
 /* ------------------------------------------------------------------ */
 
-function CardsSection({ cards, accounts, patch }) {
+function CardsSection({ cards, accounts, bills = [], patch }) {
   const [open, setOpen] = useState(cards.length === 0);
   const [name, setName] = useState("");
   const [balance, setBalance] = useState("");
@@ -2969,6 +3413,19 @@ function CardsSection({ cards, accounts, patch }) {
   };
 
   const delCard = (id) => patch((d) => { d.cards = (d.cards || []).filter((x) => x.id !== id); return d; });
+
+  const addCardToBills = (card, day, accountId) => patch((d) => {
+    const billId = uid();
+    d.bills.push({
+      id: billId, name: `${card.name} (min payment)`, amount: card.minPayment || 0,
+      day: Math.min(31, Math.max(1, day || 1)),
+      accountId: accountId || d.accounts[0]?.id || "", paidMonth: "",
+    });
+    const c = (d.cards || []).find((x) => x.id === card.id);
+    if (c) c.billId = billId;
+    return d;
+  });
+  const cardLinkedIds = cards.filter((c) => c.billId && bills.some((b) => b.id === c.billId)).map((c) => c.id);
 
   const payCard = (cardId, amt, accountId) => {
     patch((d) => {
@@ -3056,7 +3513,8 @@ function CardsSection({ cards, accounts, patch }) {
 
       {cards.map((c) => (
         <CardItem key={c.id} card={c} accounts={accounts}
-          onPay={payCard} onDelete={delCard} onDeletePayment={delPayment} onEdit={() => setEditing(c)} />
+          onPay={payCard} onDelete={delCard} onDeletePayment={delPayment} onEdit={() => setEditing(c)}
+          onAddToBills={addCardToBills} linked={cardLinkedIds.includes(c.id)} />
       ))}
 
       {editing && (
@@ -3085,10 +3543,13 @@ function CardsSection({ cards, accounts, patch }) {
   );
 }
 
-function CardItem({ card: c, accounts, onPay, onDelete, onDeletePayment, onEdit }) {
+function CardItem({ card: c, accounts, onPay, onDelete, onDeletePayment, onEdit, onAddToBills, linked }) {
   const [payOpen, setPayOpen] = useState(false);
   const [payAmt, setPayAmt] = useState(String(c.minPayment || ""));
   const [payFrom, setPayFrom] = useState(accounts[0]?.id || "");
+  const [billOpen, setBillOpen] = useState(false);
+  const [billDay, setBillDay] = useState("1");
+  const [billAcct, setBillAcct] = useState("");
 
   const owed = Math.max(0, c.balance || 0);
   const inCredit = (c.balance || 0) < 0;
@@ -3186,6 +3647,39 @@ function CardItem({ card: c, accounts, onPay, onDelete, onDeletePayment, onEdit 
         <button onClick={() => setPayOpen(true)} className={`${btnPrimary} mt-4 w-full`}>
           <ArrowDownCircle size={16} /> Make a payment
         </button>
+      )}
+
+      {onAddToBills && c.minPayment > 0 && (
+        linked ? (
+          <p className="mt-2 text-center text-xs font-medium text-teal-600">✓ Min payment is in your Bills</p>
+        ) : billOpen ? (
+          <div className="mt-2 space-y-2 rounded-xl border border-stone-200 p-2.5">
+            <div className="flex items-center gap-2">
+              <span className="shrink-0 text-xs text-slate-500">Leaves on day</span>
+              <input type="number" min="1" max="31" value={billDay} onChange={(e) => setBillDay(e.target.value)}
+                className="w-14 rounded-lg border border-stone-200 px-2 py-1 text-center text-sm" />
+            </div>
+            {accounts.length > 0 && (
+              <label className="block">
+                <span className="mb-1 block text-xs text-slate-500">Comes out of</span>
+                <select value={billAcct} onChange={(e) => setBillAcct(e.target.value)}
+                  className="w-full rounded-lg border border-stone-200 px-2 py-1.5 text-sm">
+                  {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                </select>
+              </label>
+            )}
+            <div className="flex gap-2">
+              <button onClick={() => setBillOpen(false)} className="flex-1 rounded-lg border border-stone-200 px-2.5 py-1.5 text-xs font-medium text-slate-500">Cancel</button>
+              <button onClick={() => { onAddToBills(c, parseInt(billDay) || 1, billAcct || accounts[0]?.id || ""); setBillOpen(false); }}
+                className="flex-1 rounded-lg bg-teal-600 px-2.5 py-1.5 text-xs font-semibold text-white">Add to Bills</button>
+            </div>
+          </div>
+        ) : (
+          <button onClick={() => { setBillOpen(true); setBillDay("1"); setBillAcct(accounts[0]?.id || ""); }}
+            className="mt-2 w-full text-center text-xs font-medium text-teal-600 hover:underline">
+            + Add {gbp0(c.minPayment)} min payment to Bills
+          </button>
+        )
       )}
 
       {c.payments && c.payments.length > 0 && (
@@ -3392,7 +3886,9 @@ function Setup({ data, patch, onReset, onExample, onRestore, householdCode, onSi
                     <Dot color={a.color} />
                     <div>
                       <p className="text-sm font-medium text-slate-800">{a.name}</p>
-                      <p className="text-xs text-slate-400">{a.type}</p>
+                      <p className="text-xs text-slate-400">
+                        {a.type}{a.isTax && <span className="ml-1.5 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">VAT/tax</span>}
+                      </p>
                     </div>
                   </div>
                   <div className="flex items-center gap-1">
@@ -3426,9 +3922,8 @@ function Setup({ data, patch, onReset, onExample, onRestore, householdCode, onSi
                 {["Current", "Savings", "Credit", "Other"].map((t) => <option key={t} value={t}>{t}</option>)}
               </select>
             </Field>
-            <Field label="Balance now (£)">
-              <input className={inputCls} type="number" inputMode="decimal" placeholder="0.00"
-                value={accBalance} onChange={(e) => setAccBalance(e.target.value)} />
+            <Field label="Balance now (£) — use − if overdrawn">
+              <SignedMoneyInput value={accBalance} onChange={(v) => setAccBalance(v)} />
             </Field>
           </div>
           <div>
@@ -3454,13 +3949,15 @@ function Setup({ data, patch, onReset, onExample, onRestore, householdCode, onSi
           fields={[
             { key: "name", label: "Account name", type: "text" },
             { key: "type", label: "Type", type: "select", options: ["Current", "Savings", "Credit", "Other"].map((t) => ({ value: t, label: t })) },
-            { key: "balance", label: "Balance now (£)", type: "money" },
+            { key: "balance", label: "Balance now (£) — use − if overdrawn", type: "signedmoney" },
+            { key: "overdraft", label: "Overdraft limit (£, if any)", type: "money" },
+            { key: "isTax", label: "VAT/tax savings account (kept aside)", type: "toggle" },
           ]}
           onClose={() => setEditingAcct(null)}
           onSave={(vals) => {
             patch((d) => {
               const a = d.accounts.find((x) => x.id === editingAcct.id);
-              if (a) { a.name = vals.name; a.type = vals.type; a.balance = vals.balance; }
+              if (a) { a.name = vals.name; a.type = vals.type; a.balance = vals.balance; a.isTax = vals.isTax; a.overdraft = vals.overdraft; }
               return d;
             });
             setEditingAcct(null);
@@ -3624,9 +4121,10 @@ function SummaryBar({ label, value, sub }) {
 function normalizeData(parsed) {
   const p = parsed || {};
   const merged = { ...EMPTY, ...p };
-  merged.business = { accounts: [], loans: [], ...(p.business || {}) };
+  merged.business = { accounts: [], loans: [], bills: [], ...(p.business || {}) };
   if (!Array.isArray(merged.business.accounts)) merged.business.accounts = [];
   if (!Array.isArray(merged.business.loans)) merged.business.loans = [];
+  if (!Array.isArray(merged.business.bills)) merged.business.bills = [];
   if (!Array.isArray(merged.accounts)) merged.accounts = [];
   if (!Array.isArray(merged.bills)) merged.bills = [];
   if (!Array.isArray(merged.transactions)) merged.transactions = [];
