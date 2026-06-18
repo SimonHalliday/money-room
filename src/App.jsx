@@ -479,8 +479,8 @@ function EditModal({ title, fields, item, onSave, onClose }) {
                   className={`flex w-full items-center justify-between rounded-xl border px-3 py-2 text-sm font-medium transition ${draft[f.key] ? "border-teal-300 bg-teal-50 text-teal-700" : "border-stone-200 bg-stone-50 text-slate-500"}`}
                 >
                   <span>{draft[f.key] ? "Yes" : "No"}</span>
-                  <span className={`relative inline-block h-5 w-9 rounded-full transition ${draft[f.key] ? "bg-teal-600" : "bg-stone-300"}`}>
-                    <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition ${draft[f.key] ? "translate-x-4" : "translate-x-0.5"}`} />
+                  <span className={`flex h-5 w-9 shrink-0 items-center rounded-full p-0.5 transition-colors ${draft[f.key] ? "justify-end bg-teal-600" : "justify-start bg-stone-300"}`}>
+                    <span className="block h-4 w-4 rounded-full bg-white shadow-sm" />
                   </span>
                 </button>
               ) : f.type === "select" ? (
@@ -2086,6 +2086,7 @@ function StatementAnalyser({ data, patch }) {
   const [addedKeys, setAddedKeys] = useState(saved?.addedKeys || []);
   const [extracting, setExtracting] = useState(false);
   const [expandedCat, setExpandedCat] = useState(null);
+  const [billTarget, setBillTarget] = useState("");
 
   // Keep that saved copy in sync, and clear it when the analysis is cleared.
   useEffect(() => {
@@ -2162,30 +2163,32 @@ function StatementAnalyser({ data, patch }) {
   const fallback = ["#0d9488", "#4f46e5", "#db2777", "#ea580c", "#7c3aed", "#0891b2", "#65a30d", "#64748b"];
   const recurringMonthly = (result?.recurring || []).filter((r) => r.cadence === "monthly");
 
+  const personalAccts = data.accounts || [];
+  const bizAccts = data.businessEnabled !== false ? (data.business?.accounts || []) : [];
+  const defaultTarget = personalAccts[0] ? `personal:${personalAccts[0].id}` : (bizAccts[0] ? `business:${bizAccts[0].id}` : "personal:");
+  const billTargetVal = billTarget || defaultTarget;
+  const pushBill = (d, r) => {
+    const [scope, id] = billTargetVal.split(":");
+    const bill = {
+      id: uid(), name: r.name || "Recurring",
+      amount: Number(r.amount) || 0,
+      day: Math.min(31, Math.max(1, Number(r.dayOfMonth) || 1)),
+      accountId: id || "", paidMonth: "",
+    };
+    if (scope === "business") { if (!d.business.bills) d.business.bills = []; d.business.bills.push(bill); }
+    else d.bills.push(bill);
+  };
+
   const addOne = (r, i) => {
-    patch((d) => {
-      d.bills.push({
-        id: uid(), name: r.name || "Recurring",
-        amount: Number(r.amount) || 0,
-        day: Math.min(31, Math.max(1, Number(r.dayOfMonth) || 1)),
-        accountId: d.accounts[0]?.id || "",
-      });
-      return d;
-    });
+    patch((d) => { pushBill(d, r); return d; });
     setAddedKeys((k) => [...k, i]);
   };
 
   const importBills = () => {
     patch((d) => {
-      const accId = d.accounts[0]?.id || "";
       (result?.recurring || []).forEach((r, idx) => {
         if (r.cadence !== "monthly" || addedKeys.includes(idx)) return;
-        d.bills.push({
-          id: uid(), name: r.name || "Recurring",
-          amount: Number(r.amount) || 0,
-          day: Math.min(31, Math.max(1, Number(r.dayOfMonth) || 1)),
-          accountId: accId,
-        });
+        pushBill(d, r);
       });
       return d;
     });
@@ -2303,6 +2306,26 @@ function StatementAnalyser({ data, patch }) {
               {(result.recurring || []).length > 0 && (
                 <div>
                   <Eyebrow>Recurring &amp; subscriptions</Eyebrow>
+                  {recurringMonthly.length > 0 && !imported && (personalAccts.length > 0 || bizAccts.length > 0) && (
+                    <div className="mt-2">
+                      <label className="mb-1 block text-xs font-medium text-slate-500">Add these bills to</label>
+                      <select value={billTargetVal} onChange={(e) => setBillTarget(e.target.value)} className={inputCls}>
+                        {personalAccts.length > 0 && (
+                          <optgroup label="Personal">
+                            {personalAccts.map((a) => <option key={a.id} value={`personal:${a.id}`}>{a.name}</option>)}
+                          </optgroup>
+                        )}
+                        {bizAccts.length > 0 && (
+                          <optgroup label="Business">
+                            {bizAccts.map((a) => <option key={a.id} value={`business:${a.id}`}>{a.name}</option>)}
+                          </optgroup>
+                        )}
+                      </select>
+                      {billTargetVal.startsWith("business:") && (
+                        <p className="mt-1 text-xs text-slate-400">These will be added to your business bills.</p>
+                      )}
+                    </div>
+                  )}
                   <ul className="mt-2 space-y-1.5">
                     {result.recurring.map((r, i) => {
                       const isMonthly = r.cadence === "monthly";
@@ -3831,12 +3854,10 @@ function Setup({ data, patch, onReset, onExample, onRestore, householdCode, onSi
             <Briefcase size={16} className={businessOn ? "text-teal-600" : "text-slate-400"} />
             Business features {businessOn ? "on" : "off"}
           </span>
-          <span className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition ${
-            businessOn ? "bg-teal-600" : "bg-stone-300"
+          <span className={`flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition-colors ${
+            businessOn ? "justify-end bg-teal-600" : "justify-start bg-stone-300"
           }`}>
-            <span className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition ${
-              businessOn ? "translate-x-5" : "translate-x-0.5"
-            }`} />
+            <span className="block h-5 w-5 rounded-full bg-white shadow" />
           </span>
         </button>
       </Card>
