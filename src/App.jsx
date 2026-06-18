@@ -724,6 +724,7 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
   }
 
   const hasData = data.accounts.length > 0;
+  const firstRun = !hasData;
 
   return (
     <div className="min-h-screen bg-stone-50 text-slate-800">
