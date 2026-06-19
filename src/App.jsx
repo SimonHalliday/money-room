@@ -122,6 +122,39 @@ function daysUntil(date) {
   return Math.round((date - t) / 86400000);
 }
 
+// Days until the next *future* payday (a day-of-month). If today is payday, rolls to next month.
+function daysToNextPayday(day) {
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  let d = nextDue(day);
+  if (d <= today) {
+    const y = d.getFullYear(), m = d.getMonth();
+    const lastOf = new Date(y, m + 2, 0).getDate();
+    d = new Date(y, m + 1, Math.min(day, lastOf));
+  }
+  return { date: d, days: Math.max(1, daysUntil(d)) };
+}
+
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
+// Next VAT return deadline for a given quarter-end stagger.
+// qEndMonth (1-12) is one quarter-end month; quarters repeat every 3 months.
+// HMRC deadline = 1 month + 7 days after the quarter end = the 7th of (quarter-end month + 2).
+function nextVatDeadline(qEndMonth) {
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const targetMod = ((qEndMonth - 1) % 3 + 3) % 3;
+  for (let i = -3; i < 18; i++) {
+    const probe = new Date(today.getFullYear(), today.getMonth() + i, 1);
+    if (probe.getMonth() % 3 !== targetMod) continue;
+    const quarterEnd = new Date(probe.getFullYear(), probe.getMonth() + 1, 0);
+    const deadline = new Date(probe.getFullYear(), probe.getMonth() + 2, 7);
+    if (deadline >= today) return { quarterEnd, deadline };
+  }
+  return null;
+}
+
 // Project the running account balance forward, subtracting bills on the days they fall due.
 // Returns the daily points plus the lowest point and the date it happens.
 function buildProjection(startBalance, bills, days = 42) {
@@ -215,6 +248,39 @@ function monthsLeft(remaining, monthly, apr) {
   if (monthly <= remaining * r) return Infinity; // payment doesn't cover interest
   const n = -Math.log(1 - (remaining * r) / monthly) / Math.log(1 + r);
   return Math.ceil(n);
+}
+
+/* Simulate clearing every debt with a strategy ("avalanche" = highest APR first,
+   "snowball" = smallest balance first) plus an optional monthly overpayment.
+   Each cleared debt's payment rolls into the pot for the next target. */
+function simulatePayoff(debts, strategy, extraMonthly) {
+  const work = debts
+    .filter((d) => (d.balance || 0) > 0)
+    .map((d) => ({ name: d.name, kind: d.kind, bal: d.balance, monthly: d.monthly || 0, apr: d.apr || 0, clearedMonth: null }));
+  if (work.length === 0) return { months: 0, totalInterest: 0, order: [], cleared: true };
+  const minTotal = work.reduce((s, d) => s + d.monthly, 0);
+  let month = 0, totalInterest = 0;
+  const order = [];
+  const MAX = 720;
+  while (work.some((d) => d.bal > 0.005) && month < MAX) {
+    month++;
+    for (const d of work) {
+      if (d.bal > 0.005) { const i = (d.bal * d.apr) / 1200; d.bal += i; totalInterest += i; }
+    }
+    let available = minTotal + (extraMonthly || 0);
+    const owed = work.filter((d) => d.bal > 0.005);
+    for (const d of owed) { const pay = Math.min(d.monthly, d.bal); d.bal -= pay; available -= pay; }
+    const targets = owed.slice().sort((a, b) => (strategy === "snowball" ? a.bal - b.bal : b.apr - a.apr));
+    for (const d of targets) {
+      if (available <= 0.005) break;
+      if (d.bal <= 0.005) continue;
+      const pay = Math.min(available, d.bal); d.bal -= pay; available -= pay;
+    }
+    for (const d of work) {
+      if (d.bal <= 0.005 && d.clearedMonth == null) { d.bal = 0; d.clearedMonth = month; order.push({ name: d.name, kind: d.kind, month }); }
+    }
+  }
+  return { months: month, totalInterest, order, cleared: !work.some((d) => d.bal > 0.005) };
 }
 
 function termLabel(m) {
@@ -740,12 +806,15 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
   }, [monthDraws]);
 
   const upcoming = useMemo(
-    () =>
-      data.bills
-        .map((b) => ({ ...b, due: nextDue(b.day), n: daysUntil(nextDue(b.day)) }))
-        .filter((b) => b.n <= 14)
-        .sort((a, b) => a.n - b.n),
-    [data.bills]
+    () => {
+      const mk = monthKey();
+      const personal = (data.bills || []).map((b) => ({ ...b, scope: "personal", due: nextDue(b.day), n: daysUntil(nextDue(b.day)) }));
+      const business = ((data.businessEnabled !== false ? data.business?.bills : []) || []).map((b) => ({ ...b, scope: "business", due: nextDue(b.day), n: daysUntil(nextDue(b.day)) }));
+      return [...personal, ...business]
+        .filter((b) => b.n <= 14 && b.paidMonth !== mk)
+        .sort((a, b) => a.n - b.n);
+    },
+    [data.bills, data.business, data.businessEnabled]
   );
   const perAccount = useMemo(
     () =>
@@ -761,6 +830,22 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
   const resetAll = () => { setData(EMPTY); setTab("home"); };
   const loadExample = () => { setData(makeExample()); setTab("home"); };
   const restoreData = (obj) => { setData(normalizeData(obj)); setTab("home"); };
+
+  const toggleBillPaid = (billId, scope) => patch((d) => {
+    const arr = scope === "business" ? (d.business?.bills || []) : d.bills;
+    const b = arr.find((x) => x.id === billId);
+    if (b) b.paidMonth = b.paidMonth === monthKey() ? "" : monthKey();
+    return d;
+  });
+
+  const payday = Number(data.payday) || 0;
+  const paydayInfo = payday ? daysToNextPayday(payday) : null;
+  const dailyAllowance = (paydayInfo && safeToSpend > 0) ? safeToSpend / paydayInfo.days : null;
+
+  const vatRate = Number.isFinite(data.vatRate) ? data.vatRate : 20;
+  const vatQuarterEnd = [1, 2, 3].includes(data.vatQuarterEnd) ? data.vatQuarterEnd : 0;
+  const vatNext = vatQuarterEnd ? nextVatDeadline(vatQuarterEnd) : null;
+  const taxHeld = personalTaxAside + bizTaxAside;
 
   const nudges = useMemo(() => buildNudges(data), [data]);
   const addPot = (pot) => patch((d) => { if (!d.pots) d.pots = []; d.pots.push(pot); return d; });
@@ -882,6 +967,13 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
                 onGoSetup={() => setTab("setup")}
                 onGoIncome={() => setTab("income")}
                 businessOn={businessOn}
+                dailyAllowance={dailyAllowance}
+                paydayInfo={paydayInfo}
+                payday={payday}
+                onToggleBillPaid={toggleBillPaid}
+                vatRate={vatRate}
+                vatDeadline={vatNext ? vatNext.deadline : null}
+                taxHeld={taxHeld}
               />
             )}
             {tab === "income" && businessOn && (
@@ -1014,12 +1106,73 @@ function StsBreakdownCard({ breakdown, accountsLabel = "In your spendable accoun
   );
 }
 
+function TaxSetAsideCard({ vatRate, vatDeadline, taxHeld }) {
+  const [open, setOpen] = useState(false);
+  const [amount, setAmount] = useState("");
+  const [incVat, setIncVat] = useState(true);
+  const days = vatDeadline ? daysUntil(vatDeadline) : null;
+  const soon = days != null && days <= 21;
+  const amt = parseFloat(amount);
+  const rate = vatRate || 20;
+  const setAside = Number.isFinite(amt) && amt > 0 ? (incVat ? (amt * rate) / (100 + rate) : (amt * rate) / 100) : null;
+  return (
+    <Card>
+      <div className="flex items-center justify-between">
+        <Eyebrow>Tax set-aside</Eyebrow>
+        {vatDeadline && (
+          <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${soon ? "bg-rose-50 text-rose-600" : "bg-stone-100 text-slate-500"}`}>
+            {days <= 0 ? "due now" : `${days} day${days === 1 ? "" : "s"}`}
+          </span>
+        )}
+      </div>
+      {vatDeadline && (
+        <p className="mt-2 text-sm text-slate-600">
+          Next VAT return due <span className="font-semibold text-slate-900">{vatDeadline.toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" })}</span>.
+        </p>
+      )}
+      <p className="mt-1 text-sm text-slate-500">
+        You've got <span className="font-semibold tabular-nums text-slate-700">{gbp0(taxHeld)}</span> set aside in VAT/tax accounts.
+      </p>
+      {!open ? (
+        <button onClick={() => setOpen(true)} className={`${btnGhost} mt-3 w-full`}>
+          <Sparkles size={15} /> Work out a set-aside
+        </button>
+      ) : (
+        <div className="mt-3 space-y-3 rounded-2xl bg-stone-50 p-3">
+          <Field label="Amount received (£)">
+            <input className={inputCls} type="number" inputMode="decimal" placeholder="0.00" value={amount} onChange={(e) => setAmount(e.target.value)} />
+          </Field>
+          <label className="flex cursor-pointer items-center justify-between gap-3 text-sm text-slate-600">
+            <span>This amount includes VAT</span>
+            <button type="button" onClick={() => setIncVat((v) => !v)} aria-label="Toggle includes VAT"
+              className={`flex h-5 w-9 shrink-0 items-center rounded-full p-0.5 transition-colors ${incVat ? "justify-end bg-teal-600" : "justify-start bg-stone-300"}`}>
+              <span className="block h-4 w-4 rounded-full bg-white shadow-sm" />
+            </button>
+          </label>
+          {setAside != null && (
+            <div className="rounded-xl bg-white p-3 text-center">
+              <p className="text-xs text-slate-400">Set aside for tax/VAT</p>
+              <p className="text-2xl font-bold tabular-nums text-teal-700">{gbp(setAside)}</p>
+              <p className="mt-0.5 text-xs text-slate-400">
+                {incVat ? `the VAT within ${gbp0(amt)} at ${rate}%` : `${rate}% of ${gbp0(amt)}`}
+              </p>
+            </div>
+          )}
+          <button onClick={() => setOpen(false)} className="block w-full text-center text-xs text-slate-400 underline">Close</button>
+        </div>
+      )}
+    </Card>
+  );
+}
+
 function Home({
   safeToSpend, balancesTotal, remainingThisMonth, earmarked, hasBalances, breakdown,
   personalTaxAside = 0, bizAvailable = 0, bizSafe = 0, bizOutgoings = 0, bizBreakdown = null, bizTaxAside = 0, bizAccountsList = [], totalOverdraft = 0, bizOverdraft = 0,
   reserve, projection, projected, shortfall, nudges, pots, accounts, onAddPot, onDeletePot, onMovePot, onEditPot,
   drawnThisMonth, drawnTaxYear, drawsByType, committedMonthly, billsTotal, loansMonthly,
   upcoming, perAccount, acctById, onGoSetup, onGoIncome, businessOn,
+  dailyAllowance = null, paydayInfo = null, payday = 0, onToggleBillPaid = () => {},
+  vatRate = 20, vatDeadline = null, taxHeld = 0,
 }) {
   const monthName = new Date().toLocaleDateString("en-GB", { month: "long" });
   const [showBreakdown, setShowBreakdown] = useState(false);
@@ -1063,6 +1216,16 @@ function Home({
               {gbp0(balancesTotal)} in your accounts, minus {gbp0(remainingThisMonth)} still
               to leave this month{earmarked > 0 ? `, minus ${gbp0(earmarked)} you've set aside` : ""}.
             </p>
+            {dailyAllowance != null && paydayInfo && (
+              <p className="mt-3 rounded-xl bg-white/15 px-3 py-2 text-sm font-semibold" style={{ color: "rgba(255,255,255,0.95)" }}>
+                ≈ {gbp0(dailyAllowance)} a day until payday · {paydayInfo.days} day{paydayInfo.days === 1 ? "" : "s"} to go
+              </p>
+            )}
+            {dailyAllowance == null && !payday && (
+              <button onClick={onGoSetup} className="mt-3 text-xs underline decoration-white/40 underline-offset-2" style={{ color: "rgba(255,255,255,0.7)" }}>
+                Set your payday to get a daily spending number →
+              </button>
+            )}
             {personalTaxAside > 0 && (
               <p className="mt-2 text-xs" style={{ color: "rgba(255,255,255,0.7)" }}>
                 Plus {gbp0(personalTaxAside)} held for VAT/tax — kept out of this number.
@@ -1109,6 +1272,10 @@ function Home({
 
       {businessOn && bizAccountsList.length > 0 && showBizBreakdown && bizBreakdown && (
         <StsBreakdownCard breakdown={bizBreakdown} accountsLabel="In the business accounts" />
+      )}
+
+      {businessOn && vatDeadline && (
+        <TaxSetAsideCard vatRate={vatRate} vatDeadline={vatDeadline} taxHeld={taxHeld} />
       )}
 
       {/* The month ahead — forward projection */}
@@ -1312,12 +1479,27 @@ function Home({
               const a = acctById[b.accountId];
               const soon = b.n <= 3;
               return (
-                <li key={b.id} className="flex items-center justify-between gap-3 rounded-xl border border-stone-100 px-3 py-2.5">
-                  <div className="min-w-0">
-                    <p className="truncate text-sm font-semibold text-slate-800">{b.name}</p>
-                    <div className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-400">
-                      {a && <Dot color={a.color} />}
-                      <span className="truncate">{a ? a.name : "No account"}</span>
+                <li key={`${b.scope}-${b.id}`} className="flex items-center justify-between gap-3 rounded-xl border border-stone-100 px-3 py-2.5">
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <button
+                      onClick={() => onToggleBillPaid(b.id, b.scope)}
+                      title="Mark paid this month"
+                      aria-label="Mark paid"
+                      className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border-2 border-stone-300 text-transparent transition hover:border-teal-400 hover:text-teal-500"
+                    >
+                      <Check size={14} />
+                    </button>
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-semibold text-slate-800">{b.name}</p>
+                      <div className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-400">
+                        {b.scope === "business" ? (
+                          <span className="rounded bg-teal-50 px-1.5 py-0.5 text-[10px] font-semibold text-teal-700">Business</span>
+                        ) : a ? (
+                          <><Dot color={a.color} /><span className="truncate">{a.name}</span></>
+                        ) : (
+                          <span className="truncate">No account</span>
+                        )}
+                      </div>
                     </div>
                   </div>
                   <div className="text-right">
@@ -2884,6 +3066,115 @@ function LoanList({ loans, accounts, onAdd, onDelete, onLogPayment, onDeletePaym
 /*  LOANS TAB — personal | business                                   */
 /* ------------------------------------------------------------------ */
 
+function DebtPlanner({ loans, cards, bizLoans }) {
+  const [strategy, setStrategy] = useState("avalanche");
+  const [extra, setExtra] = useState(0);
+
+  const debts = useMemo(() => {
+    const out = [];
+    (loans || []).forEach((l) => { const b = owedOn(l); if (b > 0) out.push({ name: l.name, kind: "loan", balance: b, monthly: l.monthly || 0, apr: l.apr || 0 }); });
+    (bizLoans || []).forEach((l) => { const b = owedOn(l); if (b > 0) out.push({ name: l.name, kind: "bizloan", balance: b, monthly: l.monthly || 0, apr: l.apr || 0 }); });
+    (cards || []).forEach((c) => { const b = Math.max(0, c.balance || 0); if (b > 0) out.push({ name: c.name, kind: "card", balance: b, monthly: c.minPayment || 0, apr: c.apr || 0 }); });
+    return out;
+  }, [loans, cards, bizLoans]);
+
+  const minTotal = debts.reduce((s, d) => s + d.monthly, 0);
+  const chosen = useMemo(() => simulatePayoff(debts, strategy, extra), [debts, strategy, extra]);
+  const other = useMemo(() => simulatePayoff(debts, strategy === "avalanche" ? "snowball" : "avalanche", extra), [debts, strategy, extra]);
+  const baseline = useMemo(() => simulatePayoff(debts, strategy, 0), [debts, strategy]);
+
+  if (debts.length === 0) return null;
+
+  const fmtWhen = (months) => {
+    if (months <= 0) return "now";
+    const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + months);
+    const yrs = Math.floor(months / 12), mos = months % 12;
+    const dur = [yrs ? `${yrs} yr` : "", mos ? `${mos} mo` : ""].filter(Boolean).join(" ");
+    return `${d.toLocaleDateString("en-GB", { month: "short", year: "numeric" })} · ${dur}`;
+  };
+
+  const avalanche = strategy === "avalanche" ? chosen : other;
+  const snowball = strategy === "snowball" ? chosen : other;
+  const interestSaved = snowball.cleared && avalanche.cleared ? snowball.totalInterest - avalanche.totalInterest : null;
+  const monthsSooner = baseline.cleared && chosen.cleared ? baseline.months - chosen.months : null;
+  const interestVsBaseline = baseline.cleared && chosen.cleared ? baseline.totalInterest - chosen.totalInterest : null;
+
+  return (
+    <Card>
+      <Eyebrow>Debt-free plan</Eyebrow>
+
+      <div className="mt-2 flex rounded-2xl bg-stone-100 p-1">
+        <button onClick={() => setStrategy("avalanche")} className={`flex-1 rounded-xl py-1.5 text-xs font-semibold transition ${strategy === "avalanche" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}>
+          Avalanche · least interest
+        </button>
+        <button onClick={() => setStrategy("snowball")} className={`flex-1 rounded-xl py-1.5 text-xs font-semibold transition ${strategy === "snowball" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}>
+          Snowball · quick wins
+        </button>
+      </div>
+      <p className="mt-2 text-xs text-slate-400">
+        {strategy === "avalanche"
+          ? "Pays off the highest-interest debt first — cheapest overall."
+          : "Pays off the smallest balance first — fastest sense of progress."}
+      </p>
+
+      {chosen.cleared ? (
+        <div className="mt-3 rounded-2xl bg-teal-50 p-3 text-center">
+          <p className="text-xs font-semibold uppercase tracking-wide text-teal-700">Debt-free</p>
+          <p className="text-2xl font-bold text-teal-800">{fmtWhen(chosen.months)}</p>
+          <p className="mt-0.5 text-xs text-teal-700">{gbp0(chosen.totalInterest)} interest along the way</p>
+        </div>
+      ) : (
+        <div className="mt-3 rounded-2xl bg-rose-50 p-3 text-sm text-rose-700">
+          At {gbp0(minTotal + extra)}/month these debts don't fully clear — the interest is outpacing the payments. Try nudging the overpayment up.
+        </div>
+      )}
+
+      <div className="mt-3">
+        <div className="flex items-center justify-between text-sm">
+          <span className="font-medium text-slate-600">Overpay each month</span>
+          <span className="font-bold tabular-nums text-slate-900">+{gbp0(extra)}</span>
+        </div>
+        <input type="range" min="0" max="1000" step="10" value={extra} onChange={(e) => setExtra(Number(e.target.value))} className="mt-1.5 w-full accent-teal-600" />
+        {monthsSooner != null && extra > 0 && (
+          <p className="mt-1 text-xs text-slate-500">
+            {monthsSooner > 0 ? `${monthsSooner} month${monthsSooner === 1 ? "" : "s"} sooner` : "About the same time"} and {gbp0(Math.max(0, interestVsBaseline))} less interest than paying just the minimums.
+          </p>
+        )}
+      </div>
+
+      {debts.length > 1 && interestSaved != null && (
+        <p className="mt-3 rounded-xl bg-stone-50 px-3 py-2 text-xs text-slate-500">
+          {interestSaved > 0
+            ? <>Avalanche saves <span className="font-semibold text-slate-700">{gbp0(interestSaved)}</span> in interest versus snowball here.</>
+            : interestSaved < 0
+              ? <>Snowball costs <span className="font-semibold text-slate-700">{gbp0(-interestSaved)}</span> more in interest, but clears your first debt sooner.</>
+              : <>Both routes cost about the same in interest here.</>}
+        </p>
+      )}
+
+      {chosen.order.length > 0 && (
+        <>
+          <p className="mb-1.5 mt-3 text-xs font-semibold uppercase tracking-widest text-slate-400">Pay off in this order</p>
+          <ol className="space-y-1.5">
+            {chosen.order.map((o, i) => (
+              <li key={i} className="flex items-center justify-between gap-3 rounded-xl border border-stone-100 px-3 py-2">
+                <span className="flex min-w-0 items-center gap-2">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-teal-600 text-xs font-bold text-white">{i + 1}</span>
+                  <span className="truncate text-sm font-medium text-slate-700">{o.name}</span>
+                </span>
+                <span className="shrink-0 text-xs text-slate-400">{fmtWhen(o.month)}</span>
+              </li>
+            ))}
+            {!chosen.cleared && (
+              <li className="px-3 py-1 text-xs text-slate-400">…and the rest once the overpayment is enough to clear them.</li>
+            )}
+          </ol>
+        </>
+      )}
+    </Card>
+  );
+}
+
 function LoansTab({ data, drawnThisMonth, patch }) {
   const [seg, setSeg] = useState("personal");
   const businessOn = data.businessEnabled !== false;
@@ -3044,6 +3335,8 @@ function LoansTab({ data, drawnThisMonth, patch }) {
           </ul>
         </Card>
       )}
+
+      <DebtPlanner loans={data.loans} cards={data.cards} bizLoans={businessOn ? (biz.loans || []) : []} />
 
       <div className="flex rounded-2xl bg-stone-100 p-1">
         <button
@@ -3709,6 +4002,8 @@ function Setup({ data, patch, onReset, onExample, onRestore, householdCode, onSi
   const [accColor, setAccColor] = useState(ACCOUNT_COLORS[0]);
   const [accBalance, setAccBalance] = useState("");
   const [reserveStr, setReserveStr] = useState(String(data.reserve || ""));
+  const [paydayStr, setPaydayStr] = useState(String(data.payday || ""));
+  const [vatRateStr, setVatRateStr] = useState(String(Number.isFinite(data.vatRate) ? data.vatRate : 20));
   const [confirmExample, setConfirmExample] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const fileRef = useRef(null);
@@ -3780,6 +4075,20 @@ function Setup({ data, patch, onReset, onExample, onRestore, householdCode, onSi
   const saveReserve = () => {
     const v = parseFloat(reserveStr);
     patch((d) => { d.reserve = Number.isFinite(v) ? v : 0; return d; });
+  };
+
+  const savePayday = () => {
+    const v = parseInt(paydayStr);
+    patch((d) => { d.payday = (v >= 1 && v <= 31) ? v : 0; return d; });
+  };
+
+  const saveVatRate = () => {
+    const v = parseFloat(vatRateStr);
+    patch((d) => { d.vatRate = (Number.isFinite(v) && v >= 0 && v <= 100) ? v : 20; return d; });
+  };
+  const saveVatQuarter = (val) => {
+    const v = parseInt(val);
+    patch((d) => { d.vatQuarterEnd = [1, 2, 3].includes(v) ? v : 0; return d; });
   };
 
   const bAcctAdd = (acct) => patch((d) => { d.business.accounts.push(acct); return d; });
@@ -3879,6 +4188,55 @@ function Setup({ data, patch, onReset, onExample, onRestore, householdCode, onSi
           </button>
         </div>
       </Card>
+
+      {/* payday */}
+      <Card>
+        <Eyebrow>Payday</Eyebrow>
+        <p className="mb-3 mt-1 text-sm text-slate-500">
+          The day of the month your main money lands. We use it to turn your safe-to-spend into a
+          daily figure on the home screen — "£X a day until payday."
+        </p>
+        <div className="flex gap-2">
+          <input className={inputCls} type="number" inputMode="numeric" min="1" max="31" placeholder="e.g. 25"
+            value={paydayStr} onChange={(e) => setPaydayStr(e.target.value)} />
+          <button onClick={savePayday} className={btnPrimary}>
+            <Check size={16} /> Save
+          </button>
+        </div>
+        {Number(data.payday) >= 1 && (
+          <p className="mt-2 text-xs text-slate-400">
+            Set to the {ordinal(Number(data.payday))} of each month. Leave blank (or 0) to hide the daily figure.
+          </p>
+        )}
+      </Card>
+
+      {businessOn && (
+        <Card>
+          <Eyebrow>VAT &amp; tax</Eyebrow>
+          <p className="mb-3 mt-1 text-sm text-slate-500">
+            Set how much of money coming in to put aside, and when your VAT quarter ends. The home
+            screen then shows your next deadline and a quick set-aside calculator.
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Set-aside rate (%)">
+              <input className={inputCls} type="number" inputMode="decimal" min="0" max="100" placeholder="20"
+                value={vatRateStr} onChange={(e) => setVatRateStr(e.target.value)} onBlur={saveVatRate} />
+            </Field>
+            <Field label="VAT quarter ends">
+              <select className={inputCls} value={String(data.vatQuarterEnd || 0)} onChange={(e) => saveVatQuarter(e.target.value)}>
+                <option value="0">Not registered</option>
+                <option value="3">Mar / Jun / Sep / Dec</option>
+                <option value="1">Jan / Apr / Jul / Oct</option>
+                <option value="2">Feb / May / Aug / Nov</option>
+              </select>
+            </Field>
+          </div>
+          <p className="mt-2 text-xs leading-relaxed text-slate-400">
+            VAT returns are due one month and seven days after each quarter ends. Pick the stagger that
+            matches your VAT registration; choose "Not registered" to hide it.
+          </p>
+        </Card>
+      )}
 
       {/* personal accounts */}
       <Card>
@@ -4036,25 +4394,28 @@ function Setup({ data, patch, onReset, onExample, onRestore, householdCode, onSi
           Drop your bills into your phone's calendar as monthly reminders — they'll nudge you
           the day before, even when this app is closed.
         </p>
-        {data.bills.length === 0 ? (
-          <p className="rounded-xl bg-stone-50 px-3 py-4 text-center text-sm text-slate-400">
-            Add some bills first, then you can export them here.
-          </p>
-        ) : (
-          <>
-            <a
-              href={`data:text/calendar;charset=utf-8,${encodeURIComponent(icsForBills(data.bills))}`}
-              download="money-room-bills.ics"
-              className={`${btnPrimary} w-full no-underline`}
-            >
-              <CalendarClock size={16} /> Download calendar reminders
-            </a>
-            <p className="mt-2 text-xs leading-relaxed text-slate-400">
-              Open the downloaded file to add all {data.bills.length} bills to your calendar.
-              Anything due after the 28th reminds on the 28th, so no month gets skipped.
+        {(() => {
+          const reminderBills = [...(data.bills || []), ...(businessOn ? (data.business?.bills || []) : [])];
+          return reminderBills.length === 0 ? (
+            <p className="rounded-xl bg-stone-50 px-3 py-4 text-center text-sm text-slate-400">
+              Add some bills first, then you can export them here.
             </p>
-          </>
-        )}
+          ) : (
+            <>
+              <a
+                href={`data:text/calendar;charset=utf-8,${encodeURIComponent(icsForBills(reminderBills))}`}
+                download="money-room-bills.ics"
+                className={`${btnPrimary} w-full no-underline`}
+              >
+                <CalendarClock size={16} /> Download calendar reminders
+              </a>
+              <p className="mt-2 text-xs leading-relaxed text-slate-400">
+                Open the downloaded file to add all {reminderBills.length} bills{businessOn && (data.business?.bills || []).length > 0 ? " (personal + business)" : ""} to your calendar.
+                Anything due after the 28th reminds on the 28th, so no month gets skipped.
+              </p>
+            </>
+          );
+        })()}
       </Card>
 
       {/* data */}
@@ -4156,6 +4517,9 @@ function normalizeData(parsed) {
   if (!Array.isArray(merged.categories) || merged.categories.length === 0) merged.categories = [...CATEGORIES];
   if (!Number.isFinite(merged.reserve)) merged.reserve = 0;
   if (typeof merged.businessEnabled !== "boolean") merged.businessEnabled = true;
+  if (!Number.isFinite(merged.payday) || merged.payday < 1 || merged.payday > 31) merged.payday = 0;
+  if (!Number.isFinite(merged.vatRate) || merged.vatRate < 0 || merged.vatRate > 100) merged.vatRate = 20;
+  if (![0, 1, 2, 3].includes(merged.vatQuarterEnd)) merged.vatQuarterEnd = 0;
   return merged;
 }
 
