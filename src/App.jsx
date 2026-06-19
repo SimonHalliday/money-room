@@ -3278,7 +3278,7 @@ function LoansTab({ data, drawnThisMonth, patch }) {
   const anyDebt = data.loans.length + biz.loans.length + cards.length > 0;
 
   return (
-    <div className="space-y-4 lg:columns-2 lg:gap-5 lg:space-y-0 lg:[&>*]:mb-5 lg:[&>*]:break-inside-avoid">
+    <div className="space-y-4">
       {anyDebt && (
         <Card>
           <Eyebrow>Your total debt</Eyebrow>
@@ -3367,6 +3367,7 @@ function LoansTab({ data, drawnThisMonth, patch }) {
         </button>
       </div>
 
+      <div className="space-y-4 lg:columns-2 lg:gap-5 lg:space-y-0 lg:[&>*]:mb-5 lg:[&>*]:break-inside-avoid">
       {seg === "personal" ? (
         <>
           <SummaryBar label="Going to your loans monthly"
@@ -3429,6 +3430,7 @@ function LoansTab({ data, drawnThisMonth, patch }) {
       ) : (
         <CardsSection cards={cards} accounts={data.accounts} bills={data.bills} patch={patch} />
       )}
+      </div>
     </div>
   );
 }
