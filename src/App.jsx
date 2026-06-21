@@ -68,6 +68,8 @@ const EMPTY = {
   draws: [],
   cards: [],
   pots: [],
+  income: [],
+  analyses: [],
   reserve: 0,
   business: { accounts: [], loans: [], bills: [] },
   businessEnabled: true,
@@ -157,7 +159,7 @@ function nextVatDeadline(qEndMonth) {
 
 // Project the running account balance forward, subtracting bills on the days they fall due.
 // Returns the daily points plus the lowest point and the date it happens.
-function buildProjection(startBalance, bills, days = 42) {
+function buildProjection(startBalance, bills, income = [], days = 42) {
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const thisMK = monthKey(today);
   const lastOf = (yy, mm) => new Date(yy, mm + 1, 0).getDate();
@@ -178,12 +180,39 @@ function buildProjection(startBalance, bills, days = 42) {
       }
     }
   });
+  const riseByOffset = {};
+  (income || []).forEach((it) => {
+    const amt = Number(it.amount) || 0;
+    if (!amt) return;
+    if (it.kind === "once") {
+      if (!it.date) return;
+      const due = new Date(it.date + "T00:00:00"); due.setHours(0, 0, 0, 0);
+      if (due >= today && due <= end) {
+        const off = Math.round((due - today) / 86400000);
+        riseByOffset[off] = (riseByOffset[off] || 0) + amt;
+      }
+    } else {
+      const dom = Number(it.day) || 0;
+      if (!dom) return;
+      for (let k = 0; k <= 2; k++) {
+        const yy = today.getFullYear();
+        const mm = today.getMonth() + k;
+        const due = new Date(yy, mm, Math.min(dom, lastOf(yy, mm)));
+        if (due >= today && due <= end) {
+          const off = Math.round((due - today) / 86400000);
+          riseByOffset[off] = (riseByOffset[off] || 0) + amt;
+        }
+      }
+    }
+  });
   const points = [];
   let bal = startBalance;
   let low = startBalance;
   let lowOff = 0;
+  let totalIn = 0;
   for (let i = 0; i <= days; i++) {
     if (i > 0 && dropByOffset[i]) bal -= dropByOffset[i];
+    if (i > 0 && riseByOffset[i]) { bal += riseByOffset[i]; totalIn += riseByOffset[i]; }
     if (bal < low) { low = bal; lowOff = i; }
     const d = new Date(today); d.setDate(today.getDate() + i);
     points.push({
@@ -191,10 +220,11 @@ function buildProjection(startBalance, bills, days = 42) {
       label: d.toLocaleDateString("en-GB", { day: "numeric", month: "short" }),
       balance: Math.round(bal * 100) / 100,
       drop: dropByOffset[i] || 0,
+      rise: riseByOffset[i] || 0,
     });
   }
   const lowDate = new Date(today); lowDate.setDate(today.getDate() + lowOff);
-  return { points, low: Math.round(low * 100) / 100, lowDate, lowOff };
+  return { points, low: Math.round(low * 100) / 100, lowDate, lowOff, totalIn: Math.round(totalIn * 100) / 100 };
 }
 
 function isThisMonth(iso) {
@@ -406,6 +436,20 @@ function makeExample() {
       { id: "p1", name: "Christmas", target: 600, saved: 150, color: "#db2777" },
       { id: "p2", name: "Car service / MOT", target: 400, saved: 220, color: "#0891b2" },
       { id: "p3", name: "Annual insurance", target: 720, saved: 300, color: "#65a30d" },
+    ],
+    income: [
+      { id: "in1", name: "Salary", amount: 2400, kind: "monthly", day: 28 },
+      { id: "in2", name: "Invoice — Client A", amount: 3200, kind: "once", date: localISO(new Date(Date.now() + 18 * 86400000)) },
+    ],
+    analyses: [
+      { id: "an1", savedAt: localISO(new Date(Date.now() - 32 * 86400000)), period: "Last month", totalOut: 2180, byCategory: [
+        { category: "Groceries", amount: 420 }, { category: "Eating out", amount: 180 }, { category: "Transport", amount: 240 },
+        { category: "Subscriptions", amount: 95 }, { category: "Shopping", amount: 310 },
+      ] },
+      { id: "an2", savedAt: localISO(new Date(Date.now() - 2 * 86400000)), period: "This month", totalOut: 2275, byCategory: [
+        { category: "Groceries", amount: 405 }, { category: "Eating out", amount: 240 }, { category: "Transport", amount: 255 },
+        { category: "Subscriptions", amount: 80 }, { category: "Shopping", amount: 360 },
+      ] },
     ],
     business: {
       accounts: [
@@ -775,8 +819,8 @@ function MoneyApp({ data, setData, loading, householdCode, onSignOut }) {
   const projected = safeToSpend; /* balance after this month's remaining outgoings */
   const shortfall = reserve - projected; /* >0 means below reserve */
   const projection = useMemo(
-    () => buildProjection(balancesTotal, data.bills, 42),
-    [balancesTotal, data.bills]
+    () => buildProjection(balancesTotal, data.bills, data.income, 42),
+    [balancesTotal, data.bills, data.income]
   );
 
   /* ---- draws ---- */
@@ -1279,14 +1323,15 @@ function Home({
       )}
 
       {/* The month ahead — forward projection */}
-      {hasBalances && projection && projection.points.some((p) => p.drop > 0) && (
+      {hasBalances && projection && projection.points.some((p) => p.drop > 0 || p.rise > 0) && (
         <Card>
           <div className="flex items-baseline justify-between">
             <Eyebrow>The month ahead</Eyebrow>
             <span className="text-xs text-slate-400">next 6 weeks</span>
           </div>
           <p className="mb-3 mt-1 text-sm text-slate-500">
-            Your balance as upcoming bills come off — so you can see the dips before they land.
+            Your balance as bills go out and expected income comes in — so you can see the dips, and when they recover.
+            {projection.totalIn > 0 ? ` ${gbp0(projection.totalIn)} due in over the next 6 weeks.` : ""}
           </p>
           <div className="h-40 w-full">
             <ResponsiveContainer>
@@ -1807,6 +1852,129 @@ function PotsCard({ pots, earmarked, drawnTaxYear, accounts = [], onCreate, onDe
 /*  INCOME (draws)                                                     */
 /* ------------------------------------------------------------------ */
 
+function ExpectedIncome({ income, patch }) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [amount, setAmount] = useState("");
+  const [recurring, setRecurring] = useState(true);
+  const [day, setDay] = useState("28");
+  const [date, setDate] = useState(localISO());
+  const [editing, setEditing] = useState(null);
+
+  const add = () => {
+    const amt = parseFloat(amount);
+    if (!name.trim() || !Number.isFinite(amt) || amt <= 0) return;
+    patch((d) => {
+      if (!d.income) d.income = [];
+      d.income.push(recurring
+        ? { id: uid(), name: name.trim(), amount: amt, kind: "monthly", day: Math.min(31, Math.max(1, parseInt(day) || 1)) }
+        : { id: uid(), name: name.trim(), amount: amt, kind: "once", date: date || localISO() });
+      return d;
+    });
+    setName(""); setAmount(""); setOpen(false);
+  };
+  const del = (id) => patch((d) => { d.income = (d.income || []).filter((x) => x.id !== id); return d; });
+
+  const nextDate = (i) => (i.kind === "once" ? new Date(i.date + "T00:00:00") : nextDue(i.day));
+  const sorted = [...(income || [])].sort((a, b) => nextDate(a) - nextDate(b));
+  const monthlyTotal = (income || []).filter((i) => i.kind !== "once").reduce((s, i) => s + (i.amount || 0), 0);
+
+  return (
+    <Card>
+      <Eyebrow>Expected income</Eyebrow>
+      <p className="mb-3 mt-1 text-sm text-slate-500">
+        Salary, retainers, invoices you're expecting. These show on your "month ahead" so you can see when money lands — they don't change today's safe-to-spend until it actually arrives.
+      </p>
+
+      {!open ? (
+        <button onClick={() => setOpen(true)} className={`${btnPrimary} w-full`}>
+          <Plus size={16} /> Add expected income
+        </button>
+      ) : (
+        <div className="space-y-3 rounded-2xl bg-stone-50 p-3">
+          <div className="flex rounded-2xl bg-stone-100 p-1">
+            <button onClick={() => setRecurring(true)} className={`flex-1 rounded-xl py-1.5 text-xs font-semibold transition ${recurring ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}>
+              Every month
+            </button>
+            <button onClick={() => setRecurring(false)} className={`flex-1 rounded-xl py-1.5 text-xs font-semibold transition ${!recurring ? "bg-white text-slate-900 shadow-sm" : "text-slate-500"}`}>
+              One-off
+            </button>
+          </div>
+          <Field label="What is it?">
+            <input className={inputCls} placeholder={recurring ? "e.g. Salary" : "e.g. Invoice — Client X"} value={name} onChange={(e) => setName(e.target.value)} />
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Amount (£)">
+              <input className={inputCls} type="number" inputMode="decimal" placeholder="0.00" value={amount} onChange={(e) => setAmount(e.target.value)} />
+            </Field>
+            {recurring ? (
+              <Field label="Day of month">
+                <input className={inputCls} type="number" inputMode="numeric" min="1" max="31" value={day} onChange={(e) => setDay(e.target.value)} />
+              </Field>
+            ) : (
+              <Field label="Date">
+                <input className={inputCls} type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+              </Field>
+            )}
+          </div>
+          <button onClick={add} className={`${btnPrimary} w-full`}>
+            <Check size={16} /> Save
+          </button>
+        </div>
+      )}
+
+      {sorted.length > 0 && (
+        <ul className="mt-3 divide-y divide-stone-100">
+          {sorted.map((i) => {
+            const when = i.kind === "once"
+              ? `${new Date(i.date + "T00:00:00").toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })} · one-off`
+              : `${ordinal(i.day)} each month`;
+            return (
+              <li key={i.id} className="flex items-center justify-between gap-3 py-2.5">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-semibold text-slate-800">{i.name}</p>
+                  <p className="text-xs text-slate-400">{when}</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-bold tabular-nums text-emerald-600">+{gbp(i.amount)}</span>
+                  <EditBtn onClick={() => setEditing(i)} />
+                  <button onClick={() => del(i.id)} className="text-slate-300 hover:text-rose-500"><Trash2 size={16} /></button>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {monthlyTotal > 0 && (
+        <p className="mt-2 text-xs text-slate-400">{gbp0(monthlyTotal)} expected in each month from recurring sources.</p>
+      )}
+
+      {editing && (
+        <EditModal
+          title="Edit expected income"
+          item={editing}
+          fields={[
+            { key: "name", label: "What is it?", type: "text" },
+            { key: "amount", label: "Amount (£)", type: "money" },
+            ...(editing.kind === "once"
+              ? [{ key: "date", label: "Date", type: "date" }]
+              : [{ key: "day", label: "Day of month", type: "number" }]),
+          ]}
+          onClose={() => setEditing(null)}
+          onSave={(vals) => {
+            patch((d) => {
+              const it = (d.income || []).find((x) => x.id === editing.id);
+              if (it) { it.name = vals.name; it.amount = vals.amount; if (it.kind === "once") it.date = vals.date; else it.day = Math.min(31, Math.max(1, vals.day || 1)); }
+              return d;
+            });
+            setEditing(null);
+          }}
+        />
+      )}
+    </Card>
+  );
+}
+
 function Income({
   data, acctById, monthDraws, drawnThisMonth, drawnThisYear,
   drawsByType, committedMonthly, patch,
@@ -1874,6 +2042,8 @@ function Income({
           {gbp0(drawnThisYear)} so far this year · life costs ~{gbp0(committedMonthly)}/mo
         </p>
       </div>
+
+      <ExpectedIncome income={data.income} patch={patch} />
 
       <Card>
         <Eyebrow>Log money you've taken</Eyebrow>
@@ -2269,6 +2439,7 @@ function StatementAnalyser({ data, patch }) {
   const [extracting, setExtracting] = useState(false);
   const [expandedCat, setExpandedCat] = useState(null);
   const [billTarget, setBillTarget] = useState("");
+  const [savedTrend, setSavedTrend] = useState(false);
 
   // Keep that saved copy in sync, and clear it when the analysis is cleared.
   useEffect(() => {
@@ -2318,7 +2489,7 @@ function StatementAnalyser({ data, patch }) {
   const canAnalyse = (text.trim().length > 0 || pdfBase64.length > 0) && !loading && !extracting;
 
   const analyse = async () => {
-    setLoading(true); setError(null); setResult(null); setImported(false); setAddedKeys([]);
+    setLoading(true); setError(null); setResult(null); setImported(false); setAddedKeys([]); setSavedTrend(false);
     try {
       const content = [];
       if (pdfBase64) {
@@ -2364,6 +2535,27 @@ function StatementAnalyser({ data, patch }) {
   const addOne = (r, i) => {
     patch((d) => { pushBill(d, r); return d; });
     setAddedKeys((k) => [...k, i]);
+  };
+
+  const saveToTrends = () => {
+    if (!result) return;
+    patch((d) => {
+      if (!d.analyses) d.analyses = [];
+      const snap = {
+        id: uid(), savedAt: localISO(), period: result.period || "",
+        totalOut: Number(result.totalOut) || 0,
+        byCategory: (result.byCategory || []).map((c) => ({ category: c.category, amount: Number(c.amount) || 0 })),
+      };
+      const last = d.analyses[d.analyses.length - 1];
+      if (last && snap.period && last.period === snap.period) {
+        d.analyses[d.analyses.length - 1] = { ...snap, id: last.id };
+      } else {
+        d.analyses.push(snap);
+      }
+      if (d.analyses.length > 24) d.analyses = d.analyses.slice(-24);
+      return d;
+    });
+    setSavedTrend(true);
   };
 
   const importBills = () => {
@@ -2433,6 +2625,16 @@ function StatementAnalyser({ data, patch }) {
                 <Stat label="Money out" value={gbp0(result.totalOut || 0)} accent="text-rose-600" />
               </div>
               {result.period && <p className="text-center text-xs text-slate-400">{result.period}</p>}
+
+              <button
+                onClick={saveToTrends}
+                disabled={savedTrend}
+                className={savedTrend
+                  ? "flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-50 py-2.5 text-sm font-semibold text-emerald-700"
+                  : `${btnGhost} w-full`}
+              >
+                {savedTrend ? <><Check size={16} /> Saved to trends</> : <><Sparkles size={16} /> Save to trends</>}
+              </button>
 
               {cat.length > 0 && (
                 <div>
@@ -2593,6 +2795,88 @@ function StatementAnalyser({ data, patch }) {
 /*  SPENDING                                                           */
 /* ------------------------------------------------------------------ */
 
+function SpendTrends({ analyses, patch }) {
+  const list = analyses || [];
+  if (list.length === 0) return null;
+  const del = (id) => patch((d) => { d.analyses = (d.analyses || []).filter((x) => x.id !== id); return d; });
+  const fmtDate = (iso) => new Date(iso + "T00:00:00").toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+  const labelFor = (a) => a.period || fmtDate(a.savedAt);
+
+  let comparison = null;
+  if (list.length >= 2) {
+    const cur = list[list.length - 1];
+    const prev = list[list.length - 2];
+    const curMap = Object.fromEntries((cur.byCategory || []).map((c) => [c.category, c.amount || 0]));
+    const prevMap = Object.fromEntries((prev.byCategory || []).map((c) => [c.category, c.amount || 0]));
+    const cats = Array.from(new Set([...Object.keys(curMap), ...Object.keys(prevMap)]));
+    const rows = cats
+      .map((c) => ({ category: c, cur: curMap[c] || 0, prev: prevMap[c] || 0, delta: (curMap[c] || 0) - (prevMap[c] || 0) }))
+      .filter((r) => Math.abs(r.delta) >= 1)
+      .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+    comparison = { cur, prev, rows, totalDelta: (cur.totalOut || 0) - (prev.totalOut || 0) };
+  }
+
+  return (
+    <Card>
+      <Eyebrow>Spending trends</Eyebrow>
+      {comparison ? (
+        <>
+          <p className="mb-3 mt-1 text-sm text-slate-500">
+            {labelFor(comparison.cur)} vs {labelFor(comparison.prev)}.
+          </p>
+          <div className={`rounded-2xl p-3 text-center ${comparison.totalDelta > 0 ? "bg-rose-50" : "bg-emerald-50"}`}>
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Total spending</p>
+            <p className={`text-2xl font-bold tabular-nums ${comparison.totalDelta > 0 ? "text-rose-700" : "text-emerald-700"}`}>
+              {comparison.totalDelta > 0 ? "+" : ""}{gbp0(comparison.totalDelta)}
+            </p>
+            <p className="text-xs text-slate-400">
+              {comparison.totalDelta > 0 ? "more than last time" : comparison.totalDelta < 0 ? "less than last time" : "no change"}
+            </p>
+          </div>
+          {comparison.rows.length > 0 && (
+            <ul className="mt-3 divide-y divide-stone-100">
+              {comparison.rows.slice(0, 10).map((r) => (
+                <li key={r.category} className="flex items-center justify-between gap-3 py-2">
+                  <span className="flex min-w-0 items-center gap-2">
+                    <Dot color={CATEGORY_COLOURS[r.category] || "#94a3b8"} />
+                    <span className="truncate text-sm text-slate-700">{r.category}</span>
+                  </span>
+                  <span className="flex shrink-0 items-center gap-2 text-sm">
+                    <span className="tabular-nums text-slate-400">{gbp0(r.cur)}</span>
+                    <span className={`tabular-nums font-semibold ${r.delta > 0 ? "text-rose-600" : "text-emerald-600"}`}>
+                      {r.delta > 0 ? "↑" : "↓"} {gbp0(Math.abs(r.delta))}
+                    </span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      ) : (
+        <p className="mb-1 mt-1 text-sm text-slate-500">
+          One statement saved. Analyse next month's and hit "Save to trends" to see what's changed.
+        </p>
+      )}
+
+      <p className="mb-1.5 mt-3 text-xs font-semibold uppercase tracking-widest text-slate-400">Saved statements</p>
+      <ul className="divide-y divide-stone-100">
+        {list.slice().reverse().map((a) => (
+          <li key={a.id} className="flex items-center justify-between gap-3 py-2">
+            <div className="min-w-0">
+              <p className="truncate text-sm font-medium text-slate-700">{labelFor(a)}</p>
+              <p className="text-xs text-slate-400">saved {fmtDate(a.savedAt)}</p>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <span className="text-sm font-bold tabular-nums text-slate-900">{gbp0(a.totalOut)}</span>
+              <button onClick={() => del(a.id)} className="text-slate-300 hover:text-rose-500"><Trash2 size={16} /></button>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </Card>
+  );
+}
+
 function Spend({ data, acctById, spentThisMonth, patch }) {
   const cards = data.cards || [];
   const cats = data.categories?.length ? data.categories : CATEGORIES;
@@ -2668,6 +2952,8 @@ function Spend({ data, acctById, spentThisMonth, patch }) {
       <SummaryBar label="Spent this month" value={spentThisMonth} sub="not counting bills & loans" />
 
       <StatementAnalyser data={data} patch={patch} />
+
+      <SpendTrends analyses={data.analyses} patch={patch} />
 
       <Card>
         <Eyebrow>Quick add a spend</Eyebrow>
@@ -4516,6 +4802,8 @@ function normalizeData(parsed) {
   if (!Array.isArray(merged.draws)) merged.draws = [];
   if (!Array.isArray(merged.cards)) merged.cards = [];
   if (!Array.isArray(merged.pots)) merged.pots = [];
+  if (!Array.isArray(merged.income)) merged.income = [];
+  if (!Array.isArray(merged.analyses)) merged.analyses = [];
   if (!Array.isArray(merged.categories) || merged.categories.length === 0) merged.categories = [...CATEGORIES];
   if (!Number.isFinite(merged.reserve)) merged.reserve = 0;
   if (typeof merged.businessEnabled !== "boolean") merged.businessEnabled = true;
